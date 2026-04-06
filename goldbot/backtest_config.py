@@ -52,6 +52,7 @@ class GoldBacktestConfig:
         rolling_days = _env_float("GOLD_BACKTEST_ROLLING_DAYS", "BACKTEST_ROLLING_DAYS", default=30.0)
         end_raw = _env_text("GOLD_BACKTEST_END", "BACKTEST_END")
         start_raw = _env_text("GOLD_BACKTEST_START", "BACKTEST_START")
+        default_event_file = "historical_events/usd_major_events_2026_q1_q2.json"
 
         end = parse_utc_datetime(end_raw) if end_raw else _align_hour(reference)
         start = parse_utc_datetime(start_raw) if start_raw else end - timedelta(days=rolling_days)
@@ -66,5 +67,5 @@ class GoldBacktestConfig:
             cache_dir=_env_text("GOLD_BACKTEST_CACHE_DIR", default="backtest_cache"),
             warmup_days=_env_int("GOLD_BACKTEST_WARMUP_DAYS", default=90),
             simulated_spread=_env_float("GOLD_BACKTEST_SIMULATED_SPREAD", default=0.25),
-            event_file=_env_text("GOLD_BACKTEST_EVENT_FILE", default=""),
+            event_file=_env_text("GOLD_BACKTEST_EVENT_FILE", default=default_event_file),
         )

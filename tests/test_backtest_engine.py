@@ -15,12 +15,30 @@ class StubProvider:
     def load_frames(self, config: GoldBacktestConfig, instrument: str) -> dict[str, pd.DataFrame]:
         return self.frames
 
+    def load_aux_h4_frames(self, config: GoldBacktestConfig, instruments: list[str]) -> dict[str, pd.DataFrame]:
+        base_frame = self.frames["H4"].tail(140).copy()
+        aux: dict[str, pd.DataFrame] = {}
+        for instrument in instruments:
+            frame = base_frame.copy()
+            if instrument in {"EUR_USD", "GBP_USD"}:
+                frame["close"] = frame["close"] / 3000.0
+                frame["open"] = frame["open"] / 3000.0
+                frame["high"] = frame["high"] / 3000.0
+                frame["low"] = frame["low"] / 3000.0
+            else:
+                frame["close"] = 140.0 + (frame.index * 0.05)
+                frame["open"] = frame["close"] - 0.03
+                frame["high"] = frame["close"] + 0.06
+                frame["low"] = frame["close"] - 0.06
+            aux[instrument] = frame.reset_index(drop=True)
+        return aux
+
     def load_events(self, event_file: str):
         return []
 
 
 class StubEngine(GoldBacktestEngine):
-    def _score_at_time(self, timestamp, frames, events, session_name):
+    def _score_at_time(self, timestamp, frames, usd_proxy_frames, events, session_name):
         if session_name == "ASIA":
             return None
         return Opportunity(
@@ -83,10 +101,19 @@ def build_settings() -> Settings:
         exhaustion_sr_lookback=60,
         trend_ema_fast=50,
         trend_ema_slow=200,
+        trend_h1_confirm_ema_period=50,
+        trend_min_strength_atr=1.25,
+        trend_fast_slope_bars=3,
+        trend_min_slope_atr=0.10,
         trend_pullback_atr_tolerance=0.65,
-        partial_profit_rr=1.0,
-        break_even_rr=1.0,
-        trailing_atr_mult=2.2,
+        trend_stopout_cooldown_hours=48,
+        usd_regime_filter_enabled=True,
+        usd_regime_fast_ema=20,
+        usd_regime_slow_ema=50,
+        usd_regime_min_bias_atr=0.35,
+        partial_profit_rr=1.25,
+        break_even_rr=1.25,
+        trailing_atr_mult=2.8,
         trailing_ema_period=20,
         atr_period=14,
         state_file="state.json",
@@ -153,3 +180,35 @@ def test_backtest_engine_runs_and_returns_equity_curve() -> None:
     assert trades
     assert trades[0]["strategy"] == "TREND_PULLBACK"
     assert "pnl" in trades[0]
+
+
+def test_backtest_engine_stopout_cooldown_blocks_immediate_reentry() -> None:
+    settings = build_settings()
+    settings = Settings(**{**settings.__dict__, "trend_stopout_cooldown_hours": 999})
+    config = GoldBacktestConfig(
+        start=datetime(2026, 4, 4, 0, 0, tzinfo=timezone.utc),
+        end=datetime(2026, 4, 6, 16, 0, tzinfo=timezone.utc),
+        initial_balance=10_000.0,
+        simulated_spread=0.0,
+    )
+
+    class CooldownEngine(StubEngine):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._forced_stop = False
+
+        def _advance_trade(self, trade, bar, frames, closed_trades):
+            if not self._forced_stop:
+                self._forced_stop = True
+                closed = self._close_trade(trade, exit_price=float(trade["stop_price"]), exit_time=bar["time"], reason="STOP_LOSS")
+                closed_trades.append(closed)
+                return closed
+            return None
+
+    engine = CooldownEngine(settings, config, StubProvider(build_frames()))
+
+    equity_curve, trades = engine.run()
+
+    assert equity_curve
+    assert len(trades) == 1
+    assert trades[0]["exit_reason"] == "STOP_LOSS"

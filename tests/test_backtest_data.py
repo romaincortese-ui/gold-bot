@@ -34,3 +34,17 @@ def test_load_frame_restores_cached_timestamps(tmp_path) -> None:
 
     assert str(frame["time"].dtype).startswith("datetime64")
     assert frame["time"].iloc[0].tzinfo is not None
+
+
+def test_load_events_supports_csv(tmp_path) -> None:
+    provider = GoldHistoricalDataProvider(OandaClient(build_settings()), cache_dir=str(tmp_path))
+    event_file = tmp_path / "events.csv"
+    event_file.write_text(
+        "title,currency,impact,occurs_at,source\nUS CPI,USD,high,2026-03-11T13:30:00+00:00,test\n",
+        encoding="utf-8",
+    )
+
+    events = provider.load_events(str(event_file))
+
+    assert len(events) == 1
+    assert events[0].title == "US CPI"

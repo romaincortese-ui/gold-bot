@@ -18,6 +18,13 @@ from goldbot.indicators import (
 from goldbot.models import CalendarEvent, Opportunity
 
 
+USD_PROXY_COMPONENTS: tuple[tuple[str, float], ...] = (
+    ("EUR_USD", -1.0),
+    ("GBP_USD", -0.75),
+    ("USD_JPY", 1.0),
+)
+
+
 def score_macro_breakout(
     settings: Settings,
     now: datetime,
@@ -144,12 +151,18 @@ def score_exhaustion_reversal(settings: Settings, df_h4: pd.DataFrame, df_d1: pd
     return None
 
 
-def score_trend_pullback(settings: Settings, df_h1: pd.DataFrame, df_h4: pd.DataFrame) -> Opportunity | None:
+def score_trend_pullback(
+    settings: Settings,
+    df_h1: pd.DataFrame,
+    df_h4: pd.DataFrame,
+    usd_proxy_h4: dict[str, pd.DataFrame] | None = None,
+) -> Opportunity | None:
     if df_h1 is None or df_h4 is None or len(df_h1) < 80 or len(df_h4) < settings.trend_ema_slow + 5:
         return None
     close_h4 = df_h4["close"]
     ema_fast = calc_ema(close_h4, settings.trend_ema_fast)
     ema_slow = calc_ema(close_h4, settings.trend_ema_slow)
+    h1_confirm_ema = calc_ema(df_h1["close"], settings.trend_h1_confirm_ema_period)
     trigger_price = float(df_h1["close"].iloc[-1])
     atr_h4 = calc_atr(df_h4, settings.atr_period)
     if atr_h4 <= 0:
@@ -161,15 +174,28 @@ def score_trend_pullback(settings: Settings, df_h1: pd.DataFrame, df_h4: pd.Data
         return None
 
     ema_fast_value = float(ema_fast.iloc[-1])
+    ema_slow_value = float(ema_slow.iloc[-1])
+    trend_strength = abs(ema_fast_value - ema_slow_value) / atr_h4
+    if trend_strength < settings.trend_min_strength_atr:
+        return None
+    slope_bars = min(settings.trend_fast_slope_bars, len(ema_fast) - 1)
+    if slope_bars <= 0:
+        return None
+    ema_fast_slope_atr = (ema_fast_value - float(ema_fast.iloc[-(slope_bars + 1)])) / atr_h4
+    h1_confirm_value = float(h1_confirm_ema.iloc[-1])
+    usd_regime_bias = compute_usd_regime_bias(settings, usd_proxy_h4)
 
     if bullish_trend and (is_bullish_engulfing(df_h1) or is_pin_bar(df_h1, "LONG")):
+        if ema_fast_slope_atr < settings.trend_min_slope_atr or trigger_price < h1_confirm_value:
+            return None
+        if settings.usd_regime_filter_enabled and usd_regime_bias is not None and usd_regime_bias >= settings.usd_regime_min_bias_atr:
+            return None
         support_probe = float(df_h1["low"].tail(3).min())
         pullback_gap = abs(support_probe - ema_fast_value)
         if pullback_gap > atr_h4 * settings.trend_pullback_atr_tolerance:
             return None
         stop_price = min(float(df_h1["low"].tail(5).min()), float(ema_fast.iloc[-1])) - atr_h4 * 0.4
         risk = trigger_price - stop_price
-        trend_strength = abs(float(ema_fast.iloc[-1]) - float(ema_slow.iloc[-1])) / atr_h4
         score = 68 + min(18, trend_strength * 6)
         return Opportunity(
             strategy="TREND_PULLBACK",
@@ -180,18 +206,28 @@ def score_trend_pullback(settings: Settings, df_h1: pd.DataFrame, df_h4: pd.Data
             take_profit_price=None,
             risk_per_unit=risk,
             rationale="H4 uptrend pullback into 50 EMA with bullish confirmation candle",
-            metadata={"ema_fast": float(ema_fast.iloc[-1]), "ema_slow": float(ema_slow.iloc[-1]), "atr": atr_h4},
+            metadata={
+                "ema_fast": ema_fast_value,
+                "ema_slow": ema_slow_value,
+                "atr": atr_h4,
+                "trend_strength_atr": round(trend_strength, 3),
+                "ema_fast_slope_atr": round(ema_fast_slope_atr, 3),
+                "usd_regime_bias_atr": round(usd_regime_bias, 3) if usd_regime_bias is not None else None,
+            },
             exit_plan=_build_exit_plan(settings, "LONG", trigger_price, risk, atr_h4, timeframe="H1"),
         )
 
     if bearish_trend and (is_bearish_engulfing(df_h1) or is_pin_bar(df_h1, "SHORT")):
+        if ema_fast_slope_atr > -settings.trend_min_slope_atr or trigger_price > h1_confirm_value:
+            return None
+        if settings.usd_regime_filter_enabled and usd_regime_bias is not None and usd_regime_bias <= -settings.usd_regime_min_bias_atr:
+            return None
         resistance_probe = float(df_h1["high"].tail(3).max())
         pullback_gap = abs(resistance_probe - ema_fast_value)
         if pullback_gap > atr_h4 * settings.trend_pullback_atr_tolerance:
             return None
         stop_price = max(float(df_h1["high"].tail(5).max()), float(ema_fast.iloc[-1])) + atr_h4 * 0.4
         risk = stop_price - trigger_price
-        trend_strength = abs(float(ema_fast.iloc[-1]) - float(ema_slow.iloc[-1])) / atr_h4
         score = 68 + min(18, trend_strength * 6)
         return Opportunity(
             strategy="TREND_PULLBACK",
@@ -202,10 +238,41 @@ def score_trend_pullback(settings: Settings, df_h1: pd.DataFrame, df_h4: pd.Data
             take_profit_price=None,
             risk_per_unit=risk,
             rationale="H4 downtrend pullback into 50 EMA with bearish confirmation candle",
-            metadata={"ema_fast": float(ema_fast.iloc[-1]), "ema_slow": float(ema_slow.iloc[-1]), "atr": atr_h4},
+            metadata={
+                "ema_fast": ema_fast_value,
+                "ema_slow": ema_slow_value,
+                "atr": atr_h4,
+                "trend_strength_atr": round(trend_strength, 3),
+                "ema_fast_slope_atr": round(ema_fast_slope_atr, 3),
+                "usd_regime_bias_atr": round(usd_regime_bias, 3) if usd_regime_bias is not None else None,
+            },
             exit_plan=_build_exit_plan(settings, "SHORT", trigger_price, risk, atr_h4, timeframe="H1"),
         )
     return None
+
+
+def compute_usd_regime_bias(settings: Settings, usd_proxy_h4: dict[str, pd.DataFrame] | None) -> float | None:
+    if not settings.usd_regime_filter_enabled or not usd_proxy_h4:
+        return None
+
+    weighted_bias = 0.0
+    total_weight = 0.0
+    for instrument, orientation in USD_PROXY_COMPONENTS:
+        frame = usd_proxy_h4.get(instrument)
+        if frame is None or len(frame) < settings.usd_regime_slow_ema + 5:
+            continue
+        atr = calc_atr(frame, settings.atr_period)
+        if atr <= 0:
+            continue
+        ema_fast = calc_ema(frame["close"], settings.usd_regime_fast_ema)
+        ema_slow = calc_ema(frame["close"], settings.usd_regime_slow_ema)
+        component = orientation * ((float(ema_fast.iloc[-1]) - float(ema_slow.iloc[-1])) / atr)
+        weighted_bias += max(-3.0, min(3.0, component)) * abs(orientation)
+        total_weight += abs(orientation)
+
+    if total_weight <= 0:
+        return None
+    return weighted_bias / total_weight
 
 
 def _build_exit_plan(

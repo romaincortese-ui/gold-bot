@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import csv
 from datetime import timedelta
 from pathlib import Path
 
@@ -26,12 +27,21 @@ class GoldHistoricalDataProvider:
             "D": self._load_frame(instrument, "D", warmup_start, config.end),
         }
 
+    def load_aux_h4_frames(self, config: GoldBacktestConfig, instruments: list[str]) -> dict[str, pd.DataFrame]:
+        warmup_start = config.start - timedelta(days=config.warmup_days)
+        return {
+            instrument: self._load_frame(instrument, "H4", warmup_start, config.end)
+            for instrument in instruments
+        }
+
     def load_events(self, event_file: str) -> list[CalendarEvent]:
         if not event_file:
             return []
         path = Path(event_file)
         if not path.exists():
             return []
+        if path.suffix.lower() == ".csv":
+            return self._load_events_csv(path)
         raw = json.loads(path.read_text(encoding="utf-8"))
         events: list[CalendarEvent] = []
         for item in raw:
@@ -47,6 +57,25 @@ class GoldHistoricalDataProvider:
                 )
             except Exception:
                 continue
+        return sorted(events, key=lambda event: event.occurs_at)
+
+    def _load_events_csv(self, path: Path) -> list[CalendarEvent]:
+        events: list[CalendarEvent] = []
+        with path.open(encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for item in reader:
+                try:
+                    events.append(
+                        CalendarEvent(
+                            title=str(item["title"]),
+                            currency=str(item.get("currency", "USD")),
+                            impact=str(item.get("impact", "high")),
+                            occurs_at=parse_utc_datetime(str(item["occurs_at"])),
+                            source=str(item.get("source", "file")),
+                        )
+                    )
+                except Exception:
+                    continue
         return sorted(events, key=lambda event: event.occurs_at)
 
     def _load_frame(self, instrument: str, granularity: str, start, end) -> pd.DataFrame:

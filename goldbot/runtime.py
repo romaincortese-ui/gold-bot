@@ -4,7 +4,7 @@ import os
 import time
 import uuid
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from goldbot.indicators import calc_atr, calc_ema
@@ -30,6 +30,8 @@ log = logging.getLogger(__name__)
 
 
 class GoldBotRuntime:
+    USD_PROXY_INSTRUMENTS = ["EUR_USD", "GBP_USD", "USD_JPY"]
+
     def __init__(self) -> None:
         self.settings = load_settings()
         self.client = OandaClient(self.settings)
@@ -55,6 +57,7 @@ class GoldBotRuntime:
         state = self._load_state()
 
         self._process_control_requests(state)
+        self._prune_cooldowns(state, now)
         self._manage_open_trades(state)
 
         if state.get("paused", False):
@@ -112,12 +115,31 @@ class GoldBotRuntime:
             self._publish_runtime_status("waiting_data", state, balance=balance)
             return None
 
+        usd_proxy_frames = {}
+        if self.settings.usd_regime_filter_enabled:
+            usd_proxy_frames = {
+                instrument: self.client.fetch_candles(instrument, "H4", 120)
+                for instrument in self.USD_PROXY_INSTRUMENTS
+            }
+            if any(frame is None for frame in usd_proxy_frames.values()):
+                log.info("Skipping scan because USD proxy candle history is incomplete")
+                state.update({"last_run_at": now.isoformat(), "last_session": session_name, "skip_reason": "missing_usd_proxy_candles"})
+                self._save_state(state)
+                self._publish_runtime_status("waiting_data", state, balance=balance)
+                return None
+
         opportunities = [
             score_macro_breakout(self.settings, now, session_name, df_m15, df_h1, relevant_events),
             score_exhaustion_reversal(self.settings, df_h4, df_d1),
-            score_trend_pullback(self.settings, df_h1, df_h4),
+            score_trend_pullback(self.settings, df_h1, df_h4, usd_proxy_frames),
         ]
-        best = select_best_opportunity([opportunity for opportunity in opportunities if opportunity is not None])
+        best = select_best_opportunity(
+            [
+                opportunity
+                for opportunity in opportunities
+                if opportunity is not None and not self._is_cooldown_active(state, opportunity, now)
+            ]
+        )
         if best is None:
             log.info("No XAU/USD opportunity passed filters")
             state.update({"last_run_at": now.isoformat(), "last_session": session_name, "skip_reason": "no_signal"})
@@ -241,6 +263,8 @@ class GoldBotRuntime:
             if self._apply_exit_plan(trade, state):
                 managed.append(trade)
             else:
+                if str(trade.get("exit_reason", "")) == "STOP_LOSS":
+                    self._register_cooldown(state, trade, datetime.now(timezone.utc))
                 self.budget.release_gold_risk(trade_id)
 
         state["open_trades"] = managed
@@ -353,6 +377,7 @@ class GoldBotRuntime:
             return True
 
         if self._trade_reached_stop(trade, current_price):
+            trade["exit_reason"] = "STOP_LOSS"
             self._record_event(state, "trade_stopped", f"Trade {trade['id']} hit stop at {trade.get('stop_price')}", now=datetime.now(timezone.utc))
             return False
 
@@ -450,6 +475,7 @@ class GoldBotRuntime:
         state.setdefault("open_trades", [])
         state.setdefault("events", [])
         state.setdefault("control_requests", [])
+        state.setdefault("cooldowns", [])
         state.setdefault("paused", False)
         save_json_payload(str(self.state_path), state, self.state_key)
 
@@ -459,8 +485,47 @@ class GoldBotRuntime:
         state.setdefault("open_trades", [])
         state.setdefault("events", [])
         state.setdefault("control_requests", [])
+        state.setdefault("cooldowns", [])
         state.setdefault("paused", False)
         return state
+
+    def _register_cooldown(self, state: dict, trade: dict, now: datetime) -> None:
+        hours = self.settings.trend_stopout_cooldown_hours
+        if hours <= 0:
+            return
+        cooldowns = state.setdefault("cooldowns", [])
+        strategy = str(trade.get("strategy", ""))
+        direction = str(trade.get("direction", ""))
+        cooldowns[:] = [item for item in cooldowns if not (item.get("strategy") == strategy and item.get("direction") == direction)]
+        cooldowns.append({"strategy": strategy, "direction": direction, "expires_at": (now + timedelta(hours=hours)).isoformat(), "reason": "STOP_LOSS"})
+
+    def _prune_cooldowns(self, state: dict, now: datetime) -> None:
+        cooldowns = state.setdefault("cooldowns", [])
+        retained = []
+        for item in cooldowns:
+            try:
+                expires_at = datetime.fromisoformat(str(item["expires_at"]))
+            except Exception:
+                continue
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at > now:
+                retained.append(item)
+        state["cooldowns"] = retained
+
+    def _is_cooldown_active(self, state: dict, opportunity, now: datetime) -> bool:
+        for item in state.get("cooldowns", []):
+            if item.get("strategy") != opportunity.strategy or item.get("direction") != opportunity.direction:
+                continue
+            try:
+                expires_at = datetime.fromisoformat(str(item["expires_at"]))
+            except Exception:
+                continue
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at > now:
+                return True
+        return False
 
     @staticmethod
     def _record_event(state: dict, event_type: str, message: str, *, now: datetime) -> None:

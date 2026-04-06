@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
@@ -21,6 +21,8 @@ from goldbot.strategies import (
 
 
 class GoldBacktestEngine:
+    USD_PROXY_INSTRUMENTS = ["EUR_USD", "GBP_USD", "USD_JPY"]
+
     def __init__(self, settings: Settings, config: GoldBacktestConfig, provider: GoldHistoricalDataProvider) -> None:
         self.settings = settings
         self.config = config
@@ -29,6 +31,7 @@ class GoldBacktestEngine:
 
     def run(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         frames = self.provider.load_frames(self.config, self.settings.instrument)
+        usd_proxy_frames = self.provider.load_aux_h4_frames(self.config, self.USD_PROXY_INSTRUMENTS) if self.settings.usd_regime_filter_enabled else {}
         events = self.provider.load_events(self.config.event_file)
         h1_times = [timestamp for timestamp in frames["H1"]["time"] if self.config.start <= timestamp <= self.config.end]
         if not h1_times:
@@ -38,6 +41,7 @@ class GoldBacktestEngine:
         equity_curve: list[dict[str, Any]] = []
         trades: list[dict[str, Any]] = []
         open_trade: dict[str, Any] | None = None
+        cooldowns: dict[tuple[str, str], datetime] = {}
         last_checkpoint = frames["M15"]["time"].iloc[0]
 
         for timestamp in h1_times:
@@ -47,6 +51,8 @@ class GoldBacktestEngine:
                     closed = self._advance_trade(open_trade, bar, frames, trades)
                     if closed is not None:
                         balance += float(closed["pnl"])
+                        if str(closed.get("exit_reason")) == "STOP_LOSS":
+                            self._register_stopout_cooldown(cooldowns, open_trade, bar["time"])
                         open_trade = None
                 mark_price = float(bar["close"])
                 equity_curve.append({"time": bar["time"].isoformat(), "equity": round(balance + self._unrealized_pnl(open_trade, mark_price), 4)})
@@ -59,8 +65,10 @@ class GoldBacktestEngine:
             if session_name in {"ASIA", "OFF_HOURS"}:
                 continue
 
-            opportunity = self._score_at_time(timestamp, frames, events, session_name)
+            opportunity = self._score_at_time(timestamp, frames, usd_proxy_frames, events, session_name)
             if opportunity is None:
+                continue
+            if self._is_cooldown_active(cooldowns, opportunity, timestamp):
                 continue
 
             risk_amount = balance * self.settings.gold_budget_allocation * self.settings.max_risk_per_trade
@@ -101,6 +109,7 @@ class GoldBacktestEngine:
         self,
         timestamp: datetime,
         frames: dict[str, pd.DataFrame],
+        usd_proxy_frames: dict[str, pd.DataFrame],
         events: list[CalendarEvent],
         session_name: str,
     ) -> Opportunity | None:
@@ -108,11 +117,15 @@ class GoldBacktestEngine:
         df_h1 = frames["H1"][frames["H1"]["time"] <= timestamp].tail(240)
         df_h4 = frames["H4"][frames["H4"]["time"] <= timestamp].tail(260)
         df_d1 = frames["D"][frames["D"]["time"] <= timestamp].tail(180)
+        usd_h4 = {
+            instrument: frame[frame["time"] <= timestamp].tail(120)
+            for instrument, frame in usd_proxy_frames.items()
+        }
 
         opportunities = [
             score_macro_breakout(self.settings, timestamp, session_name, df_m15, df_h1, events),
             score_exhaustion_reversal(self.settings, df_h4, df_d1),
-            score_trend_pullback(self.settings, df_h1, df_h4),
+            score_trend_pullback(self.settings, df_h1, df_h4, usd_h4),
         ]
         return select_best_opportunity([item for item in opportunities if item is not None])
 
@@ -186,6 +199,22 @@ class GoldBacktestEngine:
             "pnl_pct": round((pnl / risk_amount) * 100.0, 4),
             "exit_reason": reason,
         }
+
+    def _is_cooldown_active(self, cooldowns: dict[tuple[str, str], datetime], opportunity: Opportunity, now: datetime) -> bool:
+        key = (opportunity.strategy, opportunity.direction)
+        expires_at = cooldowns.get(key)
+        if expires_at is None:
+            return False
+        if now >= expires_at:
+            cooldowns.pop(key, None)
+            return False
+        return True
+
+    def _register_stopout_cooldown(self, cooldowns: dict[tuple[str, str], datetime], trade: dict[str, Any], exit_time: datetime) -> None:
+        hours = self.settings.trend_stopout_cooldown_hours
+        if hours <= 0:
+            return
+        cooldowns[(str(trade["strategy"]), str(trade["direction"]))] = exit_time.astimezone(timezone.utc) + timedelta(hours=hours)
 
     def _entry_price(self, opportunity: Opportunity) -> float:
         half_spread = self.config.simulated_spread / 2.0

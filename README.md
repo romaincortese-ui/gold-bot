@@ -44,6 +44,9 @@ The bot trades only `XAU_USD` and uses three low-frequency gold playbooks:
 - Breakout entries require volume confirmation against the recent 20-candle average and, by default, are limited to the London/New York overlap.
 - Static take-profit caps are removed from new signals. Opportunities now carry an ATR-based exit plan with partial-profit, break-even, and trailing-stop parameters.
 - Low-liquidity Asian-session signals are ignored by default; the bot trades London, New York, and the overlap.
+- Trend pullback entries now require stronger H4 EMA separation, fast-EMA slope confirmation, and H1 EMA alignment so the bot is less likely to chase weak pullbacks.
+- Trend pullback entries can also be blocked when a simple USD proxy basket points the wrong way. The proxy uses OANDA H4 trends from `EUR_USD`, `GBP_USD`, and `USD_JPY` to avoid taking fresh gold longs into broad USD strength.
+- Same-direction stopout cooldowns are supported for the trend sleeve to reduce repeated re-entry attempts after a failed pullback.
 
 ## Environment Variables
 
@@ -77,10 +80,19 @@ Budget and risk:
 - `MAX_ENTRY_SPREAD=0.80`
 - `BREAKOUT_MIN_VOLUME_RATIO=1.10`
 - `BREAKOUT_OVERLAP_ONLY=true`
-- `PARTIAL_PROFIT_RR=1.0`
-- `BREAK_EVEN_RR=1.0`
-- `TRAILING_ATR_MULT=2.2`
+- `PARTIAL_PROFIT_RR=1.25`
+- `BREAK_EVEN_RR=1.25`
+- `TRAILING_ATR_MULT=2.8`
 - `TRAILING_EMA_PERIOD=20`
+- `TREND_H1_CONFIRM_EMA_PERIOD=50`
+- `TREND_MIN_STRENGTH_ATR=1.25`
+- `TREND_FAST_SLOPE_BARS=3`
+- `TREND_MIN_SLOPE_ATR=0.10`
+- `TREND_STOPOUT_COOLDOWN_HOURS=48`
+- `USD_REGIME_FILTER_ENABLED=true`
+- `USD_REGIME_FAST_EMA=20`
+- `USD_REGIME_SLOW_EMA=50`
+- `USD_REGIME_MIN_BIAS_ATR=0.35`
 
 Files:
 
@@ -126,7 +138,9 @@ Backtest notes:
 
 - Historical candles are pulled from OANDA and cached under `backtest_cache/`.
 - The runner needs valid OANDA API access for historical XAU/USD candles.
-- Macro breakout backtests use `GOLD_BACKTEST_EVENT_FILE` when you want to inject historical calendar events; without that file, the trend and exhaustion sleeves still backtest but macro breakout will usually stay inactive.
+- Macro breakout backtests use `GOLD_BACKTEST_EVENT_FILE` for historical calendar events. The repo includes `historical_events/usd_major_events_2026_q1_q2.json`, seeded from official BLS, BEA, and Federal Reserve schedules for CPI, Employment Situation, Personal Income and Outlays, and FOMC statements.
+
+For larger comparison runs, use `_run_gold_sweep.py` to rank parameter profiles over 30, 60, and 90-day windows.
 
 ## Railway Layout
 

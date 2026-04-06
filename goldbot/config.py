@@ -91,7 +91,16 @@ class Settings:
     exhaustion_sr_lookback: int
     trend_ema_fast: int
     trend_ema_slow: int
+    trend_h1_confirm_ema_period: int
+    trend_min_strength_atr: float
+    trend_fast_slope_bars: int
+    trend_min_slope_atr: float
     trend_pullback_atr_tolerance: float
+    trend_stopout_cooldown_hours: int
+    usd_regime_filter_enabled: bool
+    usd_regime_fast_ema: int
+    usd_regime_slow_ema: int
+    usd_regime_min_bias_atr: float
     partial_profit_rr: float
     break_even_rr: float
     trailing_atr_mult: float
@@ -142,10 +151,19 @@ def load_settings() -> Settings:
         exhaustion_sr_lookback=env_int("EXHAUSTION_SR_LOOKBACK", 60),
         trend_ema_fast=env_int("TREND_EMA_FAST", 50),
         trend_ema_slow=env_int("TREND_EMA_SLOW", 200),
+        trend_h1_confirm_ema_period=env_int("TREND_H1_CONFIRM_EMA_PERIOD", 50),
+        trend_min_strength_atr=env_float("TREND_MIN_STRENGTH_ATR", 1.25),
+        trend_fast_slope_bars=env_int("TREND_FAST_SLOPE_BARS", 3),
+        trend_min_slope_atr=env_float("TREND_MIN_SLOPE_ATR", 0.10),
         trend_pullback_atr_tolerance=env_float("TREND_PULLBACK_ATR_TOLERANCE", 0.65),
-        partial_profit_rr=env_float("PARTIAL_PROFIT_RR", 1.0),
-        break_even_rr=env_float("BREAK_EVEN_RR", 1.0),
-        trailing_atr_mult=env_float("TRAILING_ATR_MULT", 2.2),
+        trend_stopout_cooldown_hours=env_int("TREND_STOPOUT_COOLDOWN_HOURS", 48),
+        usd_regime_filter_enabled=env_bool("USD_REGIME_FILTER_ENABLED", True),
+        usd_regime_fast_ema=env_int("USD_REGIME_FAST_EMA", 20),
+        usd_regime_slow_ema=env_int("USD_REGIME_SLOW_EMA", 50),
+        usd_regime_min_bias_atr=env_float("USD_REGIME_MIN_BIAS_ATR", 0.35),
+        partial_profit_rr=env_float("PARTIAL_PROFIT_RR", 1.25),
+        break_even_rr=env_float("BREAK_EVEN_RR", 1.25),
+        trailing_atr_mult=env_float("TRAILING_ATR_MULT", 2.8),
         trailing_ema_period=env_int("TRAILING_EMA_PERIOD", 20),
         atr_period=env_int("ATR_PERIOD", 14),
         state_file=env_str("GOLD_STATE_FILE", "state.json"),
@@ -176,6 +194,16 @@ def _validate_settings(settings: Settings) -> None:
         raise ValueError("MAX_TOTAL_GOLD_RISK must be >= MAX_RISK_PER_TRADE")
     if settings.trend_ema_fast >= settings.trend_ema_slow:
         raise ValueError("TREND_EMA_FAST must be smaller than TREND_EMA_SLOW")
+    if settings.trend_h1_confirm_ema_period <= 0:
+        raise ValueError("TREND_H1_CONFIRM_EMA_PERIOD must be > 0")
+    if settings.trend_min_strength_atr <= 0 or settings.trend_min_slope_atr < 0:
+        raise ValueError("Trend-strength filters must be non-negative and strength must be > 0")
+    if settings.trend_fast_slope_bars <= 0 or settings.trend_stopout_cooldown_hours < 0:
+        raise ValueError("Trend slope bars must be > 0 and cooldown must be >= 0")
+    if settings.usd_regime_fast_ema <= 0 or settings.usd_regime_slow_ema <= settings.usd_regime_fast_ema:
+        raise ValueError("USD regime EMA periods must be > 0 and slow EMA must be larger than fast EMA")
+    if settings.usd_regime_min_bias_atr < 0:
+        raise ValueError("USD regime bias threshold must be >= 0")
     if settings.breakout_box_hours < 12 or settings.breakout_box_hours > 24:
         raise ValueError("BREAKOUT_BOX_HOURS should be between 12 and 24")
     if settings.max_entry_spread <= 0:

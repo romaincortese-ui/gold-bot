@@ -45,10 +45,19 @@ def build_settings() -> Settings:
         exhaustion_sr_lookback=60,
         trend_ema_fast=50,
         trend_ema_slow=200,
+        trend_h1_confirm_ema_period=50,
+        trend_min_strength_atr=1.25,
+        trend_fast_slope_bars=3,
+        trend_min_slope_atr=0.10,
         trend_pullback_atr_tolerance=0.65,
-        partial_profit_rr=1.0,
-        break_even_rr=1.0,
-        trailing_atr_mult=2.2,
+        trend_stopout_cooldown_hours=48,
+        usd_regime_filter_enabled=True,
+        usd_regime_fast_ema=20,
+        usd_regime_slow_ema=50,
+        usd_regime_min_bias_atr=0.35,
+        partial_profit_rr=1.25,
+        break_even_rr=1.25,
+        trailing_atr_mult=2.8,
         trailing_ema_period=20,
         atr_period=14,
         state_file="state.json",
@@ -94,6 +103,7 @@ def test_score_macro_breakout_finds_post_news_long_break() -> None:
 
 def test_score_trend_pullback_identifies_bullish_setup() -> None:
     settings = build_settings()
+    settings = Settings(**{**settings.__dict__, "trend_min_strength_atr": 0.5, "trend_min_slope_atr": 0.02, "trend_h1_confirm_ema_period": 20, "trend_pullback_atr_tolerance": 1.5})
     h4_times = pd.date_range(end=datetime(2026, 4, 6, tzinfo=timezone.utc), periods=260, freq="4h", tz="UTC")
     h4_rows = []
     for index, timestamp in enumerate(h4_times):
@@ -108,13 +118,13 @@ def test_score_trend_pullback_identifies_bullish_setup() -> None:
     for index, timestamp in enumerate(h1_times):
         close = 3170 - abs(60 - index) * 0.3
         open_price = close + 0.4 if index == 118 else close - 0.2
-        final_close = close + 1.4 if index == 119 else close
+        final_close = close + 3.4 if index == 119 else close
         high = max(open_price, final_close) + 0.6
         low = min(open_price, final_close) - 0.8
         h1_rows.append({"time": timestamp, "open": open_price, "high": high, "low": low, "close": final_close, "volume": 100})
     df_h1 = pd.DataFrame(h1_rows)
 
-    opportunity = score_trend_pullback(settings, df_h1, df_h4)
+    opportunity = score_trend_pullback(settings, df_h1, df_h4, build_usd_proxy_frames("weak"))
 
     assert opportunity is not None
     assert opportunity.strategy == "TREND_PULLBACK"
@@ -169,3 +179,73 @@ def test_score_macro_breakout_requires_overlap_when_enabled() -> None:
     opportunity = score_macro_breakout(settings, now, "LONDON", df_m15, df_h1, [CalendarEvent("US CPI", "USD", "high", event_time, "test")])
 
     assert opportunity is None
+
+
+def test_score_trend_pullback_rejects_weak_h4_regime() -> None:
+    settings = build_settings()
+    settings = Settings(**{**settings.__dict__, "trend_min_strength_atr": 3.0})
+
+    h4_times = pd.date_range(end=datetime(2026, 4, 6, tzinfo=timezone.utc), periods=260, freq="4h", tz="UTC")
+    h4_rows = []
+    for index, timestamp in enumerate(h4_times):
+        close = 3000 + index * 0.2
+        h4_rows.append({"time": timestamp, "open": close - 0.2, "high": close + 0.4, "low": close - 0.4, "close": close, "volume": 100})
+    df_h4 = pd.DataFrame(h4_rows)
+
+    h1_times = pd.date_range(end=datetime(2026, 4, 6, tzinfo=timezone.utc), periods=120, freq="h", tz="UTC")
+    h1_rows = []
+    for index, timestamp in enumerate(h1_times):
+        close = 3050 + index * 0.05
+        open_price = close + 0.4 if index == 118 else close - 0.2
+        final_close = close + 1.4 if index == 119 else close
+        high = max(open_price, final_close) + 0.6
+        low = min(open_price, final_close) - 0.8
+        h1_rows.append({"time": timestamp, "open": open_price, "high": high, "low": low, "close": final_close, "volume": 100})
+    df_h1 = pd.DataFrame(h1_rows)
+
+    assert score_trend_pullback(settings, df_h1, df_h4, build_usd_proxy_frames("weak")) is None
+
+
+def test_score_trend_pullback_rejects_long_when_usd_is_strong() -> None:
+    settings = build_settings()
+    settings = Settings(**{**settings.__dict__, "trend_min_strength_atr": 0.5, "trend_min_slope_atr": 0.02, "trend_h1_confirm_ema_period": 20, "trend_pullback_atr_tolerance": 1.5})
+
+    h4_times = pd.date_range(end=datetime(2026, 4, 6, tzinfo=timezone.utc), periods=260, freq="4h", tz="UTC")
+    h4_rows = []
+    for index, timestamp in enumerate(h4_times):
+        close = 2800 + index * 1.5
+        if index > 250:
+            close -= (260 - index) * 2.0
+        h4_rows.append({"time": timestamp, "open": close - 1.0, "high": close + 2.0, "low": close - 2.0, "close": close, "volume": 100})
+    df_h4 = pd.DataFrame(h4_rows)
+
+    h1_times = pd.date_range(end=datetime(2026, 4, 6, tzinfo=timezone.utc), periods=120, freq="h", tz="UTC")
+    h1_rows = []
+    for index, timestamp in enumerate(h1_times):
+        close = 3170 - abs(60 - index) * 0.3
+        open_price = close + 0.4 if index == 118 else close - 0.2
+        final_close = close + 3.4 if index == 119 else close
+        high = max(open_price, final_close) + 0.6
+        low = min(open_price, final_close) - 0.8
+        h1_rows.append({"time": timestamp, "open": open_price, "high": high, "low": low, "close": final_close, "volume": 100})
+    df_h1 = pd.DataFrame(h1_rows)
+
+    assert score_trend_pullback(settings, df_h1, df_h4, build_usd_proxy_frames("strong")) is None
+
+
+def build_usd_proxy_frames(mode: str) -> dict[str, pd.DataFrame]:
+    end = datetime(2026, 4, 6, tzinfo=timezone.utc)
+    times = pd.date_range(end=end, periods=140, freq="4h", tz="UTC")
+    specs = {
+        "EUR_USD": (1.18, -0.0012 if mode == "strong" else 0.0012),
+        "GBP_USD": (1.34, -0.0010 if mode == "strong" else 0.0010),
+        "USD_JPY": (148.0, 0.18 if mode == "strong" else -0.18),
+    }
+    frames: dict[str, pd.DataFrame] = {}
+    for instrument, (base, step) in specs.items():
+        rows = []
+        for index, timestamp in enumerate(times):
+            close = base + index * step
+            rows.append({"time": timestamp, "open": close - abs(step), "high": close + abs(step) * 2, "low": close - abs(step) * 2, "close": close, "volume": 100})
+        frames[instrument] = pd.DataFrame(rows)
+    return frames
