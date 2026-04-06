@@ -1,6 +1,6 @@
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import requests
@@ -17,6 +17,8 @@ class SpreadTooWideError(RuntimeError):
 
 
 class OandaClient:
+    MAX_CANDLES_PER_REQUEST = 4500
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.api_url = (
@@ -46,7 +48,35 @@ class OandaClient:
             f"/v3/instruments/{instrument}/candles",
             params={"granularity": granularity, "count": count, "price": "M"},
         )
-        candles = payload.get("candles", [])
+        return self._candles_to_frame(candles=payload.get("candles", []), granularity=granularity)
+
+    def fetch_candles_range(self, instrument: str, granularity: str, start: datetime, end: datetime) -> pd.DataFrame | None:
+        step = self._granularity_to_timedelta(granularity)
+        cursor = start.astimezone(timezone.utc)
+        upper_bound = end.astimezone(timezone.utc)
+        candles: list[dict] = []
+
+        while cursor < upper_bound:
+            chunk_end = min(upper_bound, cursor + (step * self.MAX_CANDLES_PER_REQUEST))
+            payload = self._get(
+                f"/v3/instruments/{instrument}/candles",
+                params={
+                    "granularity": granularity,
+                    "from": cursor.isoformat().replace("+00:00", "Z"),
+                    "to": chunk_end.isoformat().replace("+00:00", "Z"),
+                    "price": "M",
+                },
+            )
+            candles.extend(payload.get("candles", []))
+
+            if chunk_end <= cursor:
+                break
+            cursor = chunk_end
+
+        return self._candles_to_frame(candles=candles, granularity=granularity)
+
+    @staticmethod
+    def _candles_to_frame(*, candles: list[dict], granularity: str) -> pd.DataFrame | None:
         rows = []
         for candle in candles:
             if not candle.get("complete", True) and granularity != "M1":
@@ -65,7 +95,8 @@ class OandaClient:
         if not rows:
             return None
         df = pd.DataFrame(rows)
-        return df.dropna(subset=["close"])
+        df = df.dropna(subset=["close"])
+        return df.sort_values("time").drop_duplicates(subset=["time"]).reset_index(drop=True)
 
     def get_price(self, instrument: str) -> dict[str, float]:
         if self.settings.execution_mode in {"signal_only", "paper"}:
@@ -225,3 +256,19 @@ class OandaClient:
     @staticmethod
     def _format_price(price: float) -> str:
         return f"{price:.3f}"
+
+    @staticmethod
+    def _granularity_to_timedelta(granularity: str) -> timedelta:
+        normalized = granularity.strip().upper()
+        mapping = {
+            "M1": timedelta(minutes=1),
+            "M5": timedelta(minutes=5),
+            "M15": timedelta(minutes=15),
+            "M30": timedelta(minutes=30),
+            "H1": timedelta(hours=1),
+            "H4": timedelta(hours=4),
+            "D": timedelta(days=1),
+        }
+        if normalized not in mapping:
+            raise ValueError(f"Unsupported OANDA granularity for range fetch: {granularity}")
+        return mapping[normalized]

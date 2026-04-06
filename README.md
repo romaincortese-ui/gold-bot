@@ -15,6 +15,11 @@ Gold-bot is a dedicated XAU/USD bot for the same OANDA account used by the FX bo
 - `goldbot/strategies.py`: three XAU/USD strategy evaluators
 - `goldbot/budget.py`: shared-sleeve budget tracking with 50% FX / 50% Gold allocation
 - `goldbot/runtime.py`: session filters, strategy selection, sizing, and execution
+- `goldbot/backtest_config.py`: historical backtest window and artifact settings
+- `goldbot/backtest_data.py`: OANDA historical candle loading with local cache files
+- `goldbot/backtest_engine.py`: bar-by-bar XAU/USD backtest engine reusing live strategy scorers and exit plans
+- `goldbot/backtest_reporter.py`: trade journal, equity curve, and summary export helpers
+- `run_backtest.py`: backtest runner entrypoint
 - `tests/`: pure-logic unit tests
 
 ## Strategy Set
@@ -92,6 +97,36 @@ python run_macro_engine.py
 python main.py
 python run_telegram_bot.py
 ```
+
+## Backtesting
+
+Gold-bot now includes an internal historical backtest runner for XAU/USD. It reuses the live strategy scorers, the same ATR-based exit plans, and exports a trade journal, equity curve, and summary JSON.
+
+Run a 30-day backtest:
+
+```bash
+set GOLD_BACKTEST_ROLLING_DAYS=30
+set GOLD_BACKTEST_OUTPUT_DIR=backtest_output/30day
+python run_backtest.py
+```
+
+Explicit window example:
+
+```bash
+python run_backtest.py --start 2026-03-07T00:00:00Z --end 2026-04-06T00:00:00Z --output-dir backtest_output/manual_window
+```
+
+Backtest artifacts:
+
+- `backtest_output/.../equity_curve.csv`
+- `backtest_output/.../trade_journal.csv`
+- `backtest_output/.../summary.json`
+
+Backtest notes:
+
+- Historical candles are pulled from OANDA and cached under `backtest_cache/`.
+- The runner needs valid OANDA API access for historical XAU/USD candles.
+- Macro breakout backtests use `GOLD_BACKTEST_EVENT_FILE` when you want to inject historical calendar events; without that file, the trend and exhaustion sleeves still backtest but macro breakout will usually stay inactive.
 
 ## Railway Layout
 

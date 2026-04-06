@@ -7,3 +7,5 @@ state.json
 telegram_state.json
 gold_macro_state.json
 gold_news_cache.json
+backtest_output/
+backtest_cache/
