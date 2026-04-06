@@ -1,0 +1,57 @@
+import pytest
+
+from goldbot.config import Settings, _validate_settings
+
+
+def test_validate_settings_rejects_non_gold_instrument() -> None:
+    settings = Settings(
+        instrument="EUR_USD",
+        oanda_api_key="",
+        oanda_account_id="",
+        oanda_environment="practice",
+        account_type="spread_bet",
+        execution_mode="signal_only",
+        paper_balance=10_000,
+        gold_budget_allocation=0.5,
+        fx_budget_allocation=0.5,
+        max_risk_per_trade=0.005,
+        max_total_gold_risk=0.03,
+        max_open_gold_trades=1,
+        leverage=20,
+        poll_interval_seconds=60,
+        london_open_utc=7,
+        london_close_utc=16,
+        ny_open_utc=12,
+        ny_close_utc=21,
+        overlap_start_utc=12,
+        overlap_end_utc=16,
+        breakout_news_lookback_hours=8,
+        breakout_news_lookahead_hours=24,
+        pre_news_pause_minutes=30,
+        post_news_settle_minutes=20,
+        max_entry_spread=0.8,
+        breakout_box_hours=18,
+        breakout_buffer_atr=0.2,
+        breakout_min_box_atr_ratio=1.75,
+        breakout_min_volume_ratio=1.1,
+        breakout_overlap_only=True,
+        exhaustion_rr=2.5,
+        exhaustion_rsi_overbought=72,
+        exhaustion_rsi_oversold=28,
+        exhaustion_sr_lookback=60,
+        trend_ema_fast=50,
+        trend_ema_slow=200,
+        trend_pullback_atr_tolerance=0.65,
+        partial_profit_rr=1.0,
+        break_even_rr=1.0,
+        trailing_atr_mult=2.2,
+        trailing_ema_period=20,
+        atr_period=14,
+        state_file="state.json",
+        shared_budget_file="shared.json",
+        macro_state_file="macro.json",
+        news_cache_file="cache.json",
+        news_urls=["https://example.com"],
+    )
+    with pytest.raises(ValueError):
+        _validate_settings(settings)
