@@ -152,6 +152,8 @@ Use separate Railway services or workers for the Gold stack:
 
 The included [Gold-bot/Procfile](Gold-bot/Procfile) and [Gold-bot/Dockerfile](Gold-bot/Dockerfile) support that layout directly.
 
+For GitHub-backed Railway services, the repo also includes [Gold-bot/railway_entrypoint.py](Gold-bot/railway_entrypoint.py). All three services can use the same image/start command and select behavior via `GOLD_SERVICE_ROLE=worker|macro|telegram`.
+
 For local runs the services can share [Gold-bot/state.json](Gold-bot/state.json). For separate Railway services, set `REDIS_URL` so the runtime state, pause/resume controls, runtime-status heartbeats, and shared budget all move onto Redis.
 
 The Telegram worker reads runtime events and open-trade status from the shared Gold state and supports these commands:
