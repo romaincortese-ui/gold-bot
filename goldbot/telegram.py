@@ -178,7 +178,7 @@ class GoldTelegramClient:
         )
 
     def _runtime_snapshot(self, state: dict) -> dict:
-        runtime_status = load_runtime_status(self.bot_status_key, str(self.bot_status_path)) or {}
+        runtime_status = load_runtime_status(self.bot_status_key, str(self.bot_status_path), self.status_ttl) or {}
         state_balance = state.get("account_balance")
         state_currency = state.get("account_currency")
         execution_mode = runtime_status.get("execution_mode") or state.get("execution_mode") or self.settings.execution_mode

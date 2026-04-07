@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from pathlib import Path
 
 from goldbot.telegram import GoldTelegramClient
@@ -14,7 +15,7 @@ def test_build_status_message_reports_core_runtime_fields(tmp_path) -> None:
     client.bot_status_key = "gold_bot_runtime_status"
     client.bot_status_path = tmp_path / "gold_bot_runtime_status.json"
     original_load_runtime_status = telegram_module.load_runtime_status
-    telegram_module.load_runtime_status = lambda key, file_path=None: None
+    telegram_module.load_runtime_status = lambda key, file_path=None, max_age_seconds=None: None
     client._load_broker_snapshot = lambda: None
     message = client._build_status_message(
         {
@@ -156,7 +157,7 @@ def test_heartbeat_prefers_runtime_status_when_state_is_stale(tmp_path) -> None:
         offset_path=tmp_path / "telegram_state.json",
     )
     original_load_runtime_status = telegram_module.load_runtime_status
-    telegram_module.load_runtime_status = lambda key, file_path=None: {
+    telegram_module.load_runtime_status = lambda key, file_path=None, max_age_seconds=None: {
         "state": "idle",
         "generated_at": "2026-04-06T21:55:00+00:00",
         "last_run_at": "2026-04-06T21:54:28+00:00",
@@ -184,8 +185,18 @@ def test_status_message_uses_file_backed_runtime_status_when_redis_missing(tmp_p
         offset_path=tmp_path / "telegram_state.json",
     )
     client.bot_status_path = tmp_path / "gold_bot_runtime_status.json"
+    now = datetime.now(timezone.utc)
     client.bot_status_path.write_text(
-        '{\n  "state": "idle",\n  "generated_at": "2026-04-07T06:58:30+00:00",\n  "last_run_at": "2026-04-07T06:58:00+00:00",\n  "last_session": "ASIA",\n  "open_trades": 0,\n  "paused": false\n}',
+        (
+            '{\n'
+            f'  "state": "idle",\n'
+            f'  "generated_at": "{now.isoformat()}",\n'
+            f'  "last_run_at": "{now.isoformat()}",\n'
+            '  "last_session": "ASIA",\n'
+            '  "open_trades": 0,\n'
+            '  "paused": false\n'
+            '}'
+        ),
         encoding="utf-8",
     )
     original_load_runtime_status = telegram_module.load_runtime_status
@@ -195,7 +206,29 @@ def test_status_message_uses_file_backed_runtime_status_when_redis_missing(tmp_p
     message = client._build_status_message({"events": [], "signals": [], "open_trades": [], "paused": False})
 
     assert "🤖 Worker: 🟢 Idle" in message
-    assert "💓 Worker heartbeat: Today at 06:58 UTC" in message
+    assert "💓 Worker heartbeat: Today at " in message
+
+
+def test_status_message_ignores_stale_file_backed_runtime_status(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    client = GoldTelegramClient(
+        token="token",
+        chat_id="123",
+        state_path=tmp_path / "state.json",
+        offset_path=tmp_path / "telegram_state.json",
+    )
+    client.status_ttl = 60
+    client.bot_status_path = tmp_path / "gold_bot_runtime_status.json"
+    client.bot_status_path.write_text(
+        '{\n  "state": "scanning",\n  "generated_at": "2026-04-07T08:22:00+00:00",\n  "last_run_at": "2026-04-07T08:22:00+00:00",\n  "last_session": "LONDON",\n  "open_trades": 0,\n  "paused": false\n}',
+        encoding="utf-8",
+    )
+    client._load_broker_snapshot = lambda: None
+
+    message = client._build_status_message({"events": [], "signals": [], "open_trades": [], "paused": False})
+
+    assert "🤖 Worker: 🔴 Offline" in message
+    assert "💓 Worker heartbeat: never" in message
 
 
 def test_status_message_surfaces_worker_error(tmp_path, monkeypatch) -> None:
@@ -207,8 +240,15 @@ def test_status_message_surfaces_worker_error(tmp_path, monkeypatch) -> None:
         offset_path=tmp_path / "telegram_state.json",
     )
     client.bot_status_path = tmp_path / "gold_bot_runtime_status.json"
+    now = datetime.now(timezone.utc)
     client.bot_status_path.write_text(
-        '{\n  "state": "error",\n  "generated_at": "2026-04-07T07:10:00+00:00",\n  "error": "boom"\n}',
+        (
+            '{\n'
+            '  "state": "error",\n'
+            f'  "generated_at": "{now.isoformat()}",\n'
+            '  "error": "boom"\n'
+            '}'
+        ),
         encoding="utf-8",
     )
     client._load_broker_snapshot = lambda: None

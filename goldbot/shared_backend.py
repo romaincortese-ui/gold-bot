@@ -96,7 +96,7 @@ def publish_runtime_status(service: str, state: str, *, redis_key: str | None, t
     return published
 
 
-def load_runtime_status(redis_key: str | None, file_path: str | None = None) -> dict | None:
+def load_runtime_status(redis_key: str | None, file_path: str | None = None, max_age_seconds: int | None = None) -> dict | None:
     client = get_redis_client()
     if client is not None and redis_key:
         try:
@@ -114,6 +114,23 @@ def load_runtime_status(redis_key: str | None, file_path: str | None = None) -> 
         return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        return payload if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            return None
+        if max_age_seconds is not None and max_age_seconds > 0:
+            generated_at = payload.get("generated_at")
+            if not generated_at:
+                return None
+            try:
+                parsed = datetime.fromisoformat(str(generated_at).replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            else:
+                parsed = parsed.astimezone(timezone.utc)
+            age_seconds = (datetime.now(timezone.utc) - parsed).total_seconds()
+            if age_seconds > max_age_seconds:
+                return None
+        return payload
     except Exception:
         return None

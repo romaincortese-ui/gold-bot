@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta, timezone
 
 from goldbot import shared_backend
 
@@ -48,3 +49,14 @@ def test_load_runtime_status_falls_back_to_file_when_redis_get_fails(tmp_path, m
 
     assert payload is not None
     assert payload["state"] == "idle"
+
+
+def test_load_runtime_status_rejects_stale_file_payload(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "status.json"
+    stale_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    target.write_text(json.dumps({"state": "idle", "generated_at": stale_time}), encoding="utf-8")
+    monkeypatch.setattr(shared_backend, "get_redis_client", lambda: None)
+
+    payload = shared_backend.load_runtime_status(None, str(target), max_age_seconds=60)
+
+    assert payload is None
