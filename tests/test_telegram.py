@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from goldbot.telegram import GoldTelegramClient
+import goldbot.telegram as telegram_module
 
 
 def test_build_status_message_reports_core_runtime_fields(tmp_path) -> None:
@@ -10,6 +11,11 @@ def test_build_status_message_reports_core_runtime_fields(tmp_path) -> None:
         state_path=tmp_path / "state.json",
         offset_path=tmp_path / "telegram_state.json",
     )
+    client.bot_status_key = "gold_bot_runtime_status"
+    client.bot_status_path = tmp_path / "gold_bot_runtime_status.json"
+    original_load_runtime_status = telegram_module.load_runtime_status
+    telegram_module.load_runtime_status = lambda key, file_path=None: None
+    client._load_broker_snapshot = lambda: None
     message = client._build_status_message(
         {
             "last_run_at": "2026-04-06T12:00:00+00:00",
@@ -19,10 +25,13 @@ def test_build_status_message_reports_core_runtime_fields(tmp_path) -> None:
             "open_trades": [{"id": "1"}],
         }
     )
+    telegram_module.load_runtime_status = original_load_runtime_status
 
-    assert "Last run: 2026-04-06T12:00:00+00:00" in message
+    assert "📊 <b>Gold Status</b>" in message
+    assert "Last run: " in message
     assert "Open trades: 1" in message
-    assert "Paused: True" in message
+    assert "⏯️ Bot: Paused" in message
+    assert "🤖 Worker: 🟠 No heartbeat" in message
 
 
 def test_build_recent_events_message_uses_latest_events(tmp_path) -> None:
@@ -41,7 +50,7 @@ def test_build_recent_events_message_uses_latest_events(tmp_path) -> None:
         }
     )
 
-    assert "trade_opened" in message
+    assert "trade opened" in message
     assert "Moved stop" in message
 
 
@@ -53,7 +62,7 @@ def test_handle_unknown_command_returns_help(tmp_path) -> None:
         offset_path=Path(tmp_path / "telegram_state.json"),
     )
     reply = client._handle_command("/wat")
-    assert "Supported commands" in reply
+    assert "Gold Bot Commands" in reply
 
 
 def test_pause_and_resume_commands_queue_control_requests(tmp_path) -> None:
@@ -103,6 +112,7 @@ def test_risk_command_uses_budget_snapshot(tmp_path) -> None:
         state_path=Path(tmp_path / "state.json"),
         offset_path=Path(tmp_path / "telegram_state.json"),
     )
+    client._load_broker_snapshot = lambda: None
     message = client._build_risk_message(
         {
             "account_balance": 10000.0,
@@ -110,5 +120,54 @@ def test_risk_command_uses_budget_snapshot(tmp_path) -> None:
         }
     )
 
-    assert "Account balance: 10000.00" in message
-    assert "Tracked open risk: 25.00" in message
+    assert "Balance: GBP10,000.00" in message
+    assert "Tracked open risk: GBP25.00" in message
+
+
+def test_heartbeat_prefers_runtime_status_when_state_is_stale(tmp_path) -> None:
+    client = GoldTelegramClient(
+        token="token",
+        chat_id="123",
+        state_path=tmp_path / "state.json",
+        offset_path=tmp_path / "telegram_state.json",
+    )
+    original_load_runtime_status = telegram_module.load_runtime_status
+    telegram_module.load_runtime_status = lambda key, file_path=None: {
+        "state": "idle",
+        "generated_at": "2026-04-06T21:55:00+00:00",
+        "last_run_at": "2026-04-06T21:54:28+00:00",
+        "open_trades": 2,
+        "paused": False,
+    }
+    client._save_state({"events": [], "signals": [], "open_trades": [], "paused": False})
+
+    message = client._build_heartbeat_message()
+
+    telegram_module.load_runtime_status = original_load_runtime_status
+
+    assert "Last runtime update: " in message
+    assert "never" not in message
+    assert "Worker: 🟢 Idle" in message
+    assert "Open trades: 2" in message
+
+
+def test_status_message_uses_file_backed_runtime_status_when_redis_missing(tmp_path) -> None:
+    client = GoldTelegramClient(
+        token="token",
+        chat_id="123",
+        state_path=tmp_path / "state.json",
+        offset_path=tmp_path / "telegram_state.json",
+    )
+    client.bot_status_path = tmp_path / "gold_bot_runtime_status.json"
+    client.bot_status_path.write_text(
+        '{\n  "state": "idle",\n  "generated_at": "2026-04-07T06:58:30+00:00",\n  "last_run_at": "2026-04-07T06:58:00+00:00",\n  "last_session": "ASIA",\n  "open_trades": 0,\n  "paused": false\n}',
+        encoding="utf-8",
+    )
+    original_load_runtime_status = telegram_module.load_runtime_status
+    telegram_module.load_runtime_status = original_load_runtime_status
+    client._load_broker_snapshot = lambda: None
+
+    message = client._build_status_message({"events": [], "signals": [], "open_trades": [], "paused": False})
+
+    assert "🤖 Worker: 🟢 Idle" in message
+    assert "💓 Worker heartbeat: Today at 06:58 UTC" in message

@@ -111,6 +111,19 @@ class Settings:
     macro_state_file: str
     news_cache_file: str
     news_urls: list[str]
+    breakout_volume_mode: str = "tick"
+    breakout_external_volume_file: str = ""
+    breakout_external_volume_max_age_minutes: int = 30
+    breakout_external_min_volume_ratio: float = 1.05
+    macro_breakout_spread_settle_seconds: int = 45
+    macro_breakout_spread_stability_checks: int = 3
+    macro_breakout_spread_stability_tolerance: float = 0.15
+    real_yield_filter_enabled: bool = False
+    real_yield_state_max_age_hours: int = 24
+    real_yield_lookback_days: int = 5
+    real_yield_reduce_risk_bps: float = 7.5
+    real_yield_veto_bps: float = 15.0
+    real_yield_adverse_risk_multiplier: float = 0.5
 
 
 def load_settings() -> Settings:
@@ -174,6 +187,19 @@ def load_settings() -> Settings:
             "GOLD_NEWS_URLS",
             "https://nfs.faireconomy.media/ff_calendar_thisweek.xml,https://www.forexfactory.com/ffcal_week_this.xml",
         ),
+        breakout_volume_mode=env_str("BREAKOUT_VOLUME_MODE", "tick").lower(),
+        breakout_external_volume_file=env_str("BREAKOUT_EXTERNAL_VOLUME_FILE", ""),
+        breakout_external_volume_max_age_minutes=env_int("BREAKOUT_EXTERNAL_VOLUME_MAX_AGE_MINUTES", 30),
+        breakout_external_min_volume_ratio=env_float("BREAKOUT_EXTERNAL_MIN_VOLUME_RATIO", 1.05),
+        macro_breakout_spread_settle_seconds=env_int("MACRO_BREAKOUT_SPREAD_SETTLE_SECONDS", 45),
+        macro_breakout_spread_stability_checks=env_int("MACRO_BREAKOUT_SPREAD_STABILITY_CHECKS", 3),
+        macro_breakout_spread_stability_tolerance=env_float("MACRO_BREAKOUT_SPREAD_STABILITY_TOLERANCE", 0.15),
+        real_yield_filter_enabled=env_bool("REAL_YIELD_FILTER_ENABLED", False),
+        real_yield_state_max_age_hours=env_int("REAL_YIELD_STATE_MAX_AGE_HOURS", 24),
+        real_yield_lookback_days=env_int("REAL_YIELD_LOOKBACK_DAYS", 5),
+        real_yield_reduce_risk_bps=env_float("REAL_YIELD_REDUCE_RISK_BPS", 7.5),
+        real_yield_veto_bps=env_float("REAL_YIELD_VETO_BPS", 15.0),
+        real_yield_adverse_risk_multiplier=env_float("REAL_YIELD_ADVERSE_RISK_MULTIPLIER", 0.5),
     )
     _validate_settings(settings)
     return settings
@@ -210,5 +236,27 @@ def _validate_settings(settings: Settings) -> None:
         raise ValueError("MAX_ENTRY_SPREAD must be > 0")
     if settings.breakout_min_volume_ratio < 1.0:
         raise ValueError("BREAKOUT_MIN_VOLUME_RATIO should be >= 1.0")
+    if settings.breakout_volume_mode not in {"tick", "external", "hybrid"}:
+        raise ValueError("BREAKOUT_VOLUME_MODE must be tick, external, or hybrid")
+    if settings.breakout_external_volume_max_age_minutes < 0:
+        raise ValueError("BREAKOUT_EXTERNAL_VOLUME_MAX_AGE_MINUTES must be >= 0")
+    if settings.breakout_external_min_volume_ratio < 1.0:
+        raise ValueError("BREAKOUT_EXTERNAL_MIN_VOLUME_RATIO should be >= 1.0")
+    if settings.macro_breakout_spread_settle_seconds < 0:
+        raise ValueError("MACRO_BREAKOUT_SPREAD_SETTLE_SECONDS must be >= 0")
+    if settings.macro_breakout_spread_stability_checks <= 0:
+        raise ValueError("MACRO_BREAKOUT_SPREAD_STABILITY_CHECKS must be > 0")
+    if settings.macro_breakout_spread_stability_tolerance < 0:
+        raise ValueError("MACRO_BREAKOUT_SPREAD_STABILITY_TOLERANCE must be >= 0")
+    if settings.real_yield_state_max_age_hours < 0:
+        raise ValueError("REAL_YIELD_STATE_MAX_AGE_HOURS must be >= 0")
+    if settings.real_yield_lookback_days <= 0:
+        raise ValueError("REAL_YIELD_LOOKBACK_DAYS must be > 0")
+    if settings.real_yield_reduce_risk_bps < 0 or settings.real_yield_veto_bps < 0:
+        raise ValueError("Real-yield thresholds must be >= 0")
+    if settings.real_yield_veto_bps < settings.real_yield_reduce_risk_bps:
+        raise ValueError("REAL_YIELD_VETO_BPS must be >= REAL_YIELD_REDUCE_RISK_BPS")
+    if settings.real_yield_adverse_risk_multiplier <= 0 or settings.real_yield_adverse_risk_multiplier > 1:
+        raise ValueError("REAL_YIELD_ADVERSE_RISK_MULTIPLIER must be > 0 and <= 1")
     if settings.partial_profit_rr <= 0 or settings.break_even_rr <= 0 or settings.trailing_atr_mult <= 0:
         raise ValueError("Exit-plan multipliers must be > 0")

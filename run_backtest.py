@@ -6,7 +6,7 @@ import json
 from goldbot.backtest_config import GoldBacktestConfig, parse_utc_datetime
 from goldbot.backtest_data import GoldHistoricalDataProvider
 from goldbot.backtest_engine import GoldBacktestEngine
-from goldbot.backtest_reporter import build_report, export_artifacts
+from goldbot.backtest_reporter import build_monte_carlo_report, build_report, export_artifacts
 from goldbot.config import load_settings
 from goldbot.marketdata import OandaClient
 
@@ -31,6 +31,22 @@ def main() -> None:
     engine = GoldBacktestEngine(settings, config, provider)
     equity_curve, trades = engine.run()
     report = build_report(equity_curve, trades)
+    robustness: dict[str, object] = {}
+    if config.walk_forward_train_days > 0 and config.walk_forward_test_days > 0:
+        robustness["walk_forward"] = engine.run_walk_forward(
+            train_days=config.walk_forward_train_days,
+            test_days=config.walk_forward_test_days,
+            step_days=config.walk_forward_step_days,
+        )
+    if config.monte_carlo_iterations > 0:
+        robustness["monte_carlo"] = build_monte_carlo_report(
+            trades,
+            initial_balance=config.initial_balance,
+            iterations=config.monte_carlo_iterations,
+            ruin_threshold_pct=config.monte_carlo_ruin_threshold_pct,
+        )
+    if robustness:
+        report["robustness"] = robustness
     export_artifacts(config.output_dir, equity_curve, trades, report)
 
     print(

@@ -7,12 +7,15 @@ from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import requests
+
 from goldbot.indicators import calc_atr, calc_ema
 
 from goldbot.budget import SharedBudgetManager
 from goldbot.config import load_settings
 from goldbot.marketdata import OandaClient, SpreadTooWideError
 from goldbot.news import fetch_calendar_events, filter_gold_events
+from goldbot.real_yields import apply_real_yield_overlay, load_real_yield_signal_from_macro_state
 from goldbot.shared_backend import load_json_payload, publish_runtime_status, save_json_payload
 from goldbot.strategies import (
     score_exhaustion_reversal,
@@ -20,6 +23,7 @@ from goldbot.strategies import (
     score_trend_pullback,
     select_best_opportunity,
 )
+from goldbot.volume_oracle import load_breakout_volume_signal
 
 
 logging.basicConfig(
@@ -39,7 +43,12 @@ class GoldBotRuntime:
         self.state_path = Path(self.settings.state_file)
         self.state_key = os.getenv("GOLD_RUNTIME_STATE_KEY", "gold_runtime_state").strip()
         self.status_key = os.getenv("GOLD_BOT_STATUS_KEY", "gold_bot_runtime_status").strip()
+        self.status_path = Path(os.getenv("GOLD_BOT_STATUS_FILE", str(self.state_path.with_name("gold_bot_runtime_status.json")))).expanduser()
         self.status_ttl = int(os.getenv("GOLD_STATUS_TTL", "1800"))
+        self.telegram_token = os.getenv("GOLD_TELEGRAM_TOKEN", "").strip()
+        self.telegram_chat_id = os.getenv("GOLD_TELEGRAM_CHAT_ID", "").strip()
+        self.heartbeat_interval = int(os.getenv("GOLD_HEARTBEAT_INTERVAL", "3600"))
+        self.last_heartbeat_at = 0.0
 
     def run_forever(self) -> None:
         while True:
@@ -128,16 +137,29 @@ class GoldBotRuntime:
                 self._publish_runtime_status("waiting_data", state, balance=balance)
                 return None
 
+        breakout_volume_signal = load_breakout_volume_signal(
+            self.settings.breakout_external_volume_file,
+            now,
+            max_age_minutes=self.settings.breakout_external_volume_max_age_minutes,
+        )
+        real_yield_signal = load_real_yield_signal_from_macro_state(
+            self.settings.macro_state_file,
+            now,
+            max_age_hours=self.settings.real_yield_state_max_age_hours,
+        )
+
         opportunities = [
-            score_macro_breakout(self.settings, now, session_name, df_m15, df_h1, relevant_events),
+            score_macro_breakout(self.settings, now, session_name, df_m15, df_h1, relevant_events, breakout_volume_signal),
             score_exhaustion_reversal(self.settings, df_h4, df_d1),
             score_trend_pullback(self.settings, df_h1, df_h4, usd_proxy_frames),
         ]
         best = select_best_opportunity(
             [
-                opportunity
+                filtered
                 for opportunity in opportunities
                 if opportunity is not None and not self._is_cooldown_active(state, opportunity, now)
+                for filtered in [apply_real_yield_overlay(self.settings, opportunity, real_yield_signal)]
+                if filtered is not None
             ]
         )
         if best is None:
@@ -147,7 +169,8 @@ class GoldBotRuntime:
             self._publish_runtime_status("scanning", state, balance=balance)
             return None
 
-        risk_amount = min(snapshot.max_trade_risk_amount, snapshot.available_gold_risk)
+        risk_multiplier = float(best.metadata.get("risk_multiplier", 1.0) or 1.0)
+        risk_amount = min(snapshot.max_trade_risk_amount * risk_multiplier, snapshot.available_gold_risk)
         if risk_amount <= 0:
             log.info("No gold risk budget available")
             state.update({"last_run_at": now.isoformat(), "last_session": session_name, "skip_reason": "risk_budget_exhausted"})
@@ -164,7 +187,8 @@ class GoldBotRuntime:
             return None
 
         try:
-            result = self.client.place_market_order(best, size)
+            entry_quote = self._await_entry_quote(best)
+            result = self.client.place_market_order(best, size, quote=entry_quote)
         except SpreadTooWideError as exc:
             log.info("Skipping execution because spread is too wide: %s", exc)
             self._record_event(state, "spread_too_wide", str(exc), now=now)
@@ -224,6 +248,38 @@ class GoldBotRuntime:
         self._save_state(state)
         self._publish_runtime_status("trade_opened", state, balance=balance)
         return result
+
+    def _await_entry_quote(self, opportunity: dict) -> dict[str, float]:
+        quote = self.client.get_price(self.settings.instrument)
+        if opportunity.strategy != "MACRO_BREAKOUT" or self.settings.execution_mode != "live":
+            self.client.validate_entry_spread(quote)
+            return quote
+
+        settle_seconds = self.settings.macro_breakout_spread_settle_seconds
+        if settle_seconds <= 0:
+            self.client.validate_entry_spread(quote)
+            return quote
+
+        stable_spreads: list[float] = []
+        deadline = time.monotonic() + settle_seconds
+        while True:
+            spread = float(quote.get("spread", 0.0) or 0.0)
+            if spread <= self.settings.max_entry_spread:
+                stable_spreads.append(spread)
+                stable_spreads = stable_spreads[-self.settings.macro_breakout_spread_stability_checks :]
+                if len(stable_spreads) == self.settings.macro_breakout_spread_stability_checks:
+                    spread_range = max(stable_spreads) - min(stable_spreads)
+                    if spread_range <= self.settings.macro_breakout_spread_stability_tolerance:
+                        return quote
+            else:
+                stable_spreads.clear()
+
+            if time.monotonic() >= deadline:
+                raise SpreadTooWideError(
+                    f"Spread did not stabilize within {settle_seconds}s; last spread {spread:.3f}"
+                )
+            time.sleep(1.0)
+            quote = self.client.get_price(self.settings.instrument)
 
     def _build_trade_record(self, opportunity: dict, result: dict, size: float, risk_amount: float, opened_at: datetime) -> dict:
         return {
@@ -547,6 +603,7 @@ class GoldBotRuntime:
             state=state_name,
             redis_key=self.status_key,
             ttl_seconds=self.status_ttl,
+            file_path=str(self.status_path),
             balance=balance,
             paused=bool(state.get("paused", False)),
             open_trades=len(state.get("open_trades", [])),
@@ -554,3 +611,39 @@ class GoldBotRuntime:
             last_session=state.get("last_session"),
             skip_reason=state.get("skip_reason"),
         )
+        self._maybe_send_heartbeat(state_name, state, balance)
+
+    def _maybe_send_heartbeat(self, state_name: str, state: dict, balance: float | None) -> None:
+        if self.heartbeat_interval <= 0:
+            return
+        if not self.telegram_token or not self.telegram_chat_id:
+            return
+        now = time.time()
+        if now - self.last_heartbeat_at < self.heartbeat_interval:
+            return
+        self.last_heartbeat_at = now
+        self._send_telegram_message(self._build_heartbeat_message(state_name, state, balance))
+
+    def _build_heartbeat_message(self, state_name: str, state: dict, balance: float | None) -> str:
+        open_trades = list(state.get("open_trades", []))
+        session = state.get("last_session") or "unknown"
+        skip_reason = state.get("skip_reason") or "none"
+        last_run = state.get("last_run_at") or "never"
+        balance_text = f"{balance:.2f}" if balance is not None else "n/a"
+        return (
+            f"Gold-bot heartbeat\n"
+            f"State: {state_name}\n"
+            f"Last run: {last_run}\n"
+            f"Session: {session}\n"
+            f"Open trades: {len(open_trades)}\n"
+            f"Balance: {balance_text}\n"
+            f"Skip reason: {skip_reason}"
+        )
+
+    def _send_telegram_message(self, message: str) -> None:
+        response = requests.post(
+            f"https://api.telegram.org/bot{self.telegram_token}/sendMessage",
+            json={"chat_id": self.telegram_chat_id, "text": message},
+            timeout=10,
+        )
+        response.raise_for_status()

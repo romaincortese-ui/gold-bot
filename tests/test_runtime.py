@@ -4,7 +4,12 @@ from datetime import datetime, timezone
 from goldbot.runtime import GoldBotRuntime
 
 
+def _disable_redis(monkeypatch) -> None:
+    monkeypatch.delenv("REDIS_URL", raising=False)
+
+
 def test_manage_open_trade_moves_break_even_and_partial(tmp_path, monkeypatch) -> None:
+    _disable_redis(monkeypatch)
     runtime = GoldBotRuntime()
     runtime.state_path = tmp_path / "state.json"
 
@@ -63,6 +68,7 @@ def test_manage_open_trade_moves_break_even_and_partial(tmp_path, monkeypatch) -
 
 
 def test_run_cycle_skips_new_entry_when_state_trade_exists(tmp_path, monkeypatch) -> None:
+    _disable_redis(monkeypatch)
     runtime = GoldBotRuntime()
     runtime.state_path = tmp_path / "state.json"
     runtime._save_state(
@@ -93,6 +99,7 @@ def test_run_cycle_skips_new_entry_when_state_trade_exists(tmp_path, monkeypatch
     monkeypatch.setattr(runtime.client, "get_price", lambda instrument: {"bid": 3000.0, "ask": 3000.2, "mid": 3000.1, "spread": 0.2})
     monkeypatch.setattr(runtime.client, "fetch_candles", lambda instrument, granularity, count: None)
     monkeypatch.setattr(runtime.client, "get_account_summary", lambda: {"balance": 10000.0, "currency": "GBP"})
+    monkeypatch.setattr(runtime, "_session_name", lambda now: "LONDON")
 
     runtime.run_cycle()
     saved = json.loads(runtime.state_path.read_text(encoding="utf-8"))
@@ -100,6 +107,7 @@ def test_run_cycle_skips_new_entry_when_state_trade_exists(tmp_path, monkeypatch
 
 
 def test_run_cycle_honors_manual_pause_state(tmp_path, monkeypatch) -> None:
+    _disable_redis(monkeypatch)
     runtime = GoldBotRuntime()
     runtime.state_path = tmp_path / "state.json"
     runtime._save_state({"signals": [], "open_trades": [], "events": [], "paused": True})
@@ -112,6 +120,7 @@ def test_run_cycle_honors_manual_pause_state(tmp_path, monkeypatch) -> None:
 
 
 def test_run_cycle_applies_queued_pause_request(tmp_path, monkeypatch) -> None:
+    _disable_redis(monkeypatch)
     runtime = GoldBotRuntime()
     runtime.state_path = tmp_path / "state.json"
     runtime._save_state(
@@ -136,6 +145,7 @@ def test_run_cycle_applies_queued_pause_request(tmp_path, monkeypatch) -> None:
 
 
 def test_process_control_requests_closes_all_trades(tmp_path, monkeypatch) -> None:
+    _disable_redis(monkeypatch)
     runtime = GoldBotRuntime()
     runtime.state_path = tmp_path / "state.json"
     released_ids: list[str] = []
@@ -174,3 +184,126 @@ def test_process_control_requests_closes_all_trades(tmp_path, monkeypatch) -> No
     assert state["control_requests"] == []
     assert released_ids == ["paper-1"]
     assert any(event["type"] == "trade_closed" for event in state["events"])
+
+
+def test_publish_runtime_status_sends_heartbeat_when_interval_elapsed(monkeypatch) -> None:
+    _disable_redis(monkeypatch)
+    runtime = GoldBotRuntime()
+    sent_messages: list[str] = []
+
+    runtime.telegram_token = "token"
+    runtime.telegram_chat_id = "chat"
+    runtime.heartbeat_interval = 60
+    runtime.last_heartbeat_at = 0.0
+
+    monkeypatch.setattr("goldbot.runtime.publish_runtime_status", lambda *args, **kwargs: True)
+    monkeypatch.setattr(runtime, "_send_telegram_message", lambda message: sent_messages.append(message))
+
+    state = {
+        "last_run_at": "2026-04-06T12:00:00+00:00",
+        "last_session": "LONDON",
+        "skip_reason": "none",
+        "open_trades": [],
+        "paused": False,
+    }
+
+    runtime._publish_runtime_status("idle", state, balance=10000.0)
+
+    assert sent_messages
+    assert "Gold-bot heartbeat" in sent_messages[0]
+    assert "State: idle" in sent_messages[0]
+
+
+def test_await_entry_quote_requires_macro_spread_stability(monkeypatch) -> None:
+    _disable_redis(monkeypatch)
+    runtime = GoldBotRuntime()
+    runtime.settings = type(runtime.settings)(
+        **{
+            **runtime.settings.__dict__,
+            "execution_mode": "live",
+            "macro_breakout_spread_settle_seconds": 5,
+            "macro_breakout_spread_stability_checks": 2,
+            "macro_breakout_spread_stability_tolerance": 0.05,
+        }
+    )
+    quotes = iter(
+        [
+            {"bid": 3000.0, "ask": 3001.4, "mid": 3000.7, "spread": 1.4},
+            {"bid": 3000.0, "ask": 3000.4, "mid": 3000.2, "spread": 0.4},
+            {"bid": 3000.0, "ask": 3000.42, "mid": 3000.21, "spread": 0.42},
+        ]
+    )
+
+    monkeypatch.setattr(runtime.client, "get_price", lambda instrument: next(quotes))
+    monkeypatch.setattr("goldbot.runtime.time.sleep", lambda _: None)
+
+    quote = runtime._await_entry_quote(type("OpportunityStub", (), {"strategy": "MACRO_BREAKOUT"})())
+
+    assert quote["spread"] == 0.42
+
+
+def test_run_cycle_scales_risk_when_real_yields_are_adverse(tmp_path, monkeypatch) -> None:
+    _disable_redis(monkeypatch)
+    runtime = GoldBotRuntime()
+    runtime.state_path = tmp_path / "state.json"
+    runtime._save_state({"signals": [], "open_trades": [], "events": []})
+    runtime.settings = type(runtime.settings)(
+        **{
+            **runtime.settings.__dict__,
+            "real_yield_filter_enabled": True,
+            "macro_state_file": str(tmp_path / "macro.json"),
+            "execution_mode": "paper",
+        }
+    )
+    runtime.client.settings = runtime.settings
+    (tmp_path / "macro.json").write_text(
+        json.dumps(
+            {
+                "real_yields": {
+                    "as_of": "2026-04-07T12:00:00+00:00",
+                    "nominal_10y": 4.2,
+                    "tips_10y": 2.1,
+                    "real_yield_10y": 2.1,
+                    "real_yield_change_bps": 10.0,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(runtime, "_session_name", lambda now: "LONDON")
+    monkeypatch.setattr(runtime.client, "get_account_summary", lambda: {"balance": 10000.0, "currency": "GBP"})
+    monkeypatch.setattr(runtime.client, "fetch_candles", lambda instrument, granularity, count: __import__("pandas").DataFrame([{"time": datetime.now(timezone.utc), "open": 3000.0, "high": 3001.0, "low": 2999.0, "close": 3000.5, "volume": 100}] * 260))
+    monkeypatch.setattr(runtime.client, "calculate_xau_size", lambda risk_amount, stop_distance, account_currency: round(risk_amount, 2))
+    monkeypatch.setattr(runtime.client, "place_market_order", lambda opportunity, size, quote=None: {"id": "paper-1", "price": 3000.5, "mode": "paper"})
+    monkeypatch.setattr(runtime.client, "get_price", lambda instrument: {"bid": 3000.4, "ask": 3000.6, "mid": 3000.5, "spread": 0.2})
+    monkeypatch.setattr("goldbot.runtime.fetch_calendar_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr("goldbot.runtime.filter_gold_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        "goldbot.runtime.score_macro_breakout",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "goldbot.runtime.score_exhaustion_reversal",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "goldbot.runtime.score_trend_pullback",
+        lambda *args, **kwargs: __import__("goldbot.models", fromlist=["Opportunity"]).Opportunity(
+            strategy="TREND_PULLBACK",
+            direction="LONG",
+            score=75.0,
+            entry_price=3000.5,
+            stop_price=2995.5,
+            take_profit_price=None,
+            risk_per_unit=5.0,
+            rationale="test",
+            metadata={},
+            exit_plan={},
+        ),
+    )
+
+    runtime.run_cycle()
+    saved = json.loads(runtime.state_path.read_text(encoding="utf-8"))
+
+    assert saved["last_signal"]["risk_amount"] == 18.75

@@ -5,6 +5,7 @@ import pandas as pd
 from goldbot.config import Settings
 from goldbot.models import CalendarEvent
 from goldbot.strategies import score_macro_breakout, score_trend_pullback
+from goldbot.volume_oracle import BreakoutVolumeSignal
 
 
 def build_settings() -> Settings:
@@ -179,6 +180,46 @@ def test_score_macro_breakout_requires_overlap_when_enabled() -> None:
     opportunity = score_macro_breakout(settings, now, "LONDON", df_m15, df_h1, [CalendarEvent("US CPI", "USD", "high", event_time, "test")])
 
     assert opportunity is None
+
+
+def test_score_macro_breakout_accepts_external_volume_confirmation() -> None:
+    settings = build_settings()
+    settings = Settings(
+        **{
+            **settings.__dict__,
+            "breakout_volume_mode": "hybrid",
+            "breakout_external_min_volume_ratio": 1.2,
+        }
+    )
+    now = datetime(2026, 4, 6, 13, 0, tzinfo=timezone.utc)
+    event_time = now - timedelta(hours=1)
+    h1_times = pd.date_range(end=now, periods=40, freq="h", tz="UTC")
+    df_h1 = pd.DataFrame(
+        [{"time": timestamp, "open": 3010.0, "high": 3012.0, "low": 3008.0, "close": 3010.4, "volume": 100} for timestamp in h1_times]
+    )
+    m15_times = pd.date_range(end=now, periods=60, freq="15min", tz="UTC")
+    m15_rows = []
+    for index, timestamp in enumerate(m15_times):
+        close = 3010.0 + (index * 0.05)
+        if index >= 56:
+            close = 3014.5 + (index - 56) * 1.2
+        volume = 150 if index == len(m15_times) - 1 else 100
+        m15_rows.append({"time": timestamp, "open": close - 0.3, "high": close + 0.5, "low": close - 0.6, "close": close, "volume": volume})
+    df_m15 = pd.DataFrame(m15_rows)
+
+    opportunity = score_macro_breakout(
+        settings,
+        now,
+        "OVERLAP",
+        df_m15,
+        df_h1,
+        [CalendarEvent("US CPI", "USD", "high", event_time, "test")],
+        BreakoutVolumeSignal(source="cme", as_of=now, volume_ratio=1.35),
+    )
+
+    assert opportunity is not None
+    assert opportunity.metadata["external_volume_ratio"] == 1.35
+    assert opportunity.metadata["volume_confirmation"] == "hybrid"
 
 
 def test_score_trend_pullback_rejects_weak_h4_regime() -> None:

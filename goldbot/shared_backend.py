@@ -13,6 +13,12 @@ _redis_client = None
 _redis_url = None
 
 
+def _invalidate_redis_client() -> None:
+    global _redis_client, _redis_url
+    _redis_client = None
+    _redis_url = None
+
+
 def get_redis_client():
     global _redis_client, _redis_url
     redis_url = os.getenv("REDIS_URL", "").strip()
@@ -25,8 +31,7 @@ def get_redis_client():
         _redis_url = redis_url
         return _redis_client
     except Exception:
-        _redis_client = None
-        _redis_url = None
+        _invalidate_redis_client()
         return None
 
 
@@ -39,7 +44,7 @@ def load_json_payload(file_path: str, redis_key: str | None = None, default: dic
             if raw:
                 return json.loads(raw)
         except Exception:
-            pass
+            _invalidate_redis_client()
     path = Path(file_path)
     if not path.exists():
         return payload_default
@@ -52,22 +57,56 @@ def load_json_payload(file_path: str, redis_key: str | None = None, default: dic
 def save_json_payload(file_path: str, payload: dict, redis_key: str | None = None) -> None:
     client = get_redis_client()
     if client is not None and redis_key:
-        client.set(redis_key, json.dumps(payload))
-        return
+        try:
+            client.set(redis_key, json.dumps(payload))
+        except Exception:
+            _invalidate_redis_client()
     path = Path(file_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def publish_runtime_status(service: str, state: str, *, redis_key: str | None, ttl_seconds: int, **fields) -> bool:
+def publish_runtime_status(service: str, state: str, *, redis_key: str | None, ttl_seconds: int, file_path: str | None = None, **fields) -> bool:
     client = get_redis_client()
-    if client is None or not redis_key or ttl_seconds <= 0:
-        return False
     payload = {
         "service": service,
         "state": state,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
     payload.update(fields)
-    client.set(redis_key, json.dumps(payload), ex=ttl_seconds)
-    return True
+    published = False
+    if client is not None and redis_key and ttl_seconds > 0:
+        try:
+            client.set(redis_key, json.dumps(payload), ex=ttl_seconds)
+            published = True
+        except Exception:
+            _invalidate_redis_client()
+    if file_path:
+        path = Path(file_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        published = True
+    return published
+
+
+def load_runtime_status(redis_key: str | None, file_path: str | None = None) -> dict | None:
+    client = get_redis_client()
+    if client is not None and redis_key:
+        try:
+            raw = client.get(redis_key)
+            if raw:
+                payload = json.loads(raw)
+                if isinstance(payload, dict):
+                    return payload
+        except Exception:
+            _invalidate_redis_client()
+    if not file_path:
+        return None
+    path = Path(file_path)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None

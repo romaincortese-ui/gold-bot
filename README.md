@@ -41,11 +41,13 @@ The bot trades only `XAU_USD` and uses three low-frequency gold playbooks:
 - Gold-bot sizes risk off the gold sleeve, not the whole account.
 - Position sizing is ATR-aware because XAU/USD volatility is unstable across sessions and macro regimes.
 - Entry execution is blocked when the live XAU/USD spread is wider than `MAX_ENTRY_SPREAD` so the bot does not enter into distorted post-news pricing.
-- Breakout entries require volume confirmation against the recent 20-candle average and, by default, are limited to the London/New York overlap.
+- Macro breakout entries can wait for live spread stabilization before firing, which is meant to avoid the worst post-news OANDA spread blowouts instead of chasing the first quote spike.
+- Breakout entries require volume confirmation against the recent 20-candle average and, when configured, can also require an external exchange-volume oracle snapshot before a macro breakout is allowed.
 - Static take-profit caps are removed from new signals. Opportunities now carry an ATR-based exit plan with partial-profit, break-even, and trailing-stop parameters.
 - Low-liquidity Asian-session signals are ignored by default; the bot trades London, New York, and the overlap.
 - Trend pullback entries now require stronger H4 EMA separation, fast-EMA slope confirmation, and H1 EMA alignment so the bot is less likely to chase weak pullbacks.
 - Trend pullback entries can also be blocked when a simple USD proxy basket points the wrong way. The proxy uses OANDA H4 trends from `EUR_USD`, `GBP_USD`, and `USD_JPY` to avoid taking fresh gold longs into broad USD strength.
+- An optional real-yield overlay can veto or halve risk on gold entries when US 10Y TIPS real yields move sharply against the trade over the recent lookback window.
 - Same-direction stopout cooldowns are supported for the trend sleeve to reduce repeated re-entry attempts after a failed pullback.
 
 ## Environment Variables
@@ -69,6 +71,7 @@ Core:
 - `GOLD_TELEGRAM_STATUS_KEY=gold_telegram_runtime_status`
 - `GOLD_SHARED_BUDGET_KEY=shared_budget_state`
 - `GOLD_STATUS_TTL=1800`
+- `GOLD_HEARTBEAT_INTERVAL=3600`
 
 Budget and risk:
 
@@ -79,6 +82,19 @@ Budget and risk:
 - `MAX_OPEN_GOLD_TRADES=1`
 - `MAX_ENTRY_SPREAD=0.80`
 - `BREAKOUT_MIN_VOLUME_RATIO=1.10`
+- `BREAKOUT_VOLUME_MODE=tick|external|hybrid`
+- `BREAKOUT_EXTERNAL_VOLUME_FILE=artifacts/gc_volume_snapshot.json`
+- `BREAKOUT_EXTERNAL_VOLUME_MAX_AGE_MINUTES=30`
+- `BREAKOUT_EXTERNAL_MIN_VOLUME_RATIO=1.05`
+- `MACRO_BREAKOUT_SPREAD_SETTLE_SECONDS=45`
+- `MACRO_BREAKOUT_SPREAD_STABILITY_CHECKS=3`
+- `MACRO_BREAKOUT_SPREAD_STABILITY_TOLERANCE=0.15`
+- `REAL_YIELD_FILTER_ENABLED=false`
+- `REAL_YIELD_STATE_MAX_AGE_HOURS=24`
+- `REAL_YIELD_LOOKBACK_DAYS=5`
+- `REAL_YIELD_REDUCE_RISK_BPS=7.5`
+- `REAL_YIELD_VETO_BPS=15.0`
+- `REAL_YIELD_ADVERSE_RISK_MULTIPLIER=0.5`
 - `BREAKOUT_OVERLAP_ONLY=true`
 - `PARTIAL_PROFIT_RR=1.25`
 - `BREAK_EVEN_RR=1.25`
@@ -128,6 +144,17 @@ Explicit window example:
 python run_backtest.py --start 2026-03-07T00:00:00Z --end 2026-04-06T00:00:00Z --output-dir backtest_output/manual_window
 ```
 
+Robustness example:
+
+```bash
+set GOLD_BACKTEST_WALK_FORWARD_TRAIN_DAYS=30
+set GOLD_BACKTEST_WALK_FORWARD_TEST_DAYS=15
+set GOLD_BACKTEST_WALK_FORWARD_STEP_DAYS=15
+set GOLD_BACKTEST_MONTE_CARLO_ITERATIONS=1000
+set GOLD_BACKTEST_MONTE_CARLO_RUIN_THRESHOLD_PCT=25
+python run_backtest.py --output-dir backtest_output/robustness
+```
+
 Backtest artifacts:
 
 - `backtest_output/.../equity_curve.csv`
@@ -139,6 +166,22 @@ Backtest notes:
 - Historical candles are pulled from OANDA and cached under `backtest_cache/`.
 - The runner needs valid OANDA API access for historical XAU/USD candles.
 - Macro breakout backtests use `GOLD_BACKTEST_EVENT_FILE` for historical calendar events. The repo includes `historical_events/usd_major_events_2026_q1_q2.json`, seeded from official BLS, BEA, and Federal Reserve schedules for CPI, Employment Situation, Personal Income and Outlays, and FOMC statements.
+- Walk-forward output is written into `summary.json` under `robustness.walk_forward`, and Monte Carlo sequence-risk output is written under `robustness.monte_carlo`.
+- When `REAL_YIELD_FILTER_ENABLED=true`, the macro worker fetches current `DGS10` and `DFII10` data from FRED, writes a current real-yield snapshot into the macro state file, and the backtester pulls the matching historical series from FRED into the cache directory.
+
+External volume oracle snapshot format:
+
+```json
+{
+   "source": "databento_gc",
+   "generated_at": "2026-04-07T12:31:00Z",
+   "latest_volume_ratio": 1.42,
+   "current_volume": 18420,
+   "baseline_volume": 12970
+}
+```
+
+If `BREAKOUT_VOLUME_MODE=hybrid`, Gold-bot requires both the internal OANDA tick-volume filter and the external oracle ratio to pass before a macro breakout is tradable.
 
 For larger comparison runs, use `_run_gold_sweep.py` to rank parameter profiles over 30, 60, and 90-day windows.
 

@@ -30,16 +30,33 @@ class OandaClient:
     def uses_native_units(self) -> bool:
         return self.settings.execution_mode == "live" and bool(self.settings.oanda_api_key and self.settings.oanda_account_id)
 
-    def get_account_summary(self) -> dict:
-        if self.settings.execution_mode in {"signal_only", "paper"} or not self.settings.oanda_account_id:
+    def get_account_summary(self, *, force_broker: bool = False) -> dict:
+        if ((not force_broker) and self.settings.execution_mode in {"signal_only", "paper"}) or not self.settings.oanda_account_id:
             return {
                 "balance": self.settings.paper_balance,
+                "nav": self.settings.paper_balance,
+                "unrealized_pl": 0.0,
+                "margin_used": 0.0,
+                "margin_available": self.settings.paper_balance,
                 "currency": "GBP" if self.settings.account_type == "spread_bet" else "USD",
             }
-        payload = self._get(f"/v3/accounts/{self.settings.oanda_account_id}/summary")
+        if force_broker:
+            response = requests.get(
+                f"{self.api_url}/v3/accounts/{self.settings.oanda_account_id}/summary",
+                headers=self._headers(),
+                timeout=20,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        else:
+            payload = self._get(f"/v3/accounts/{self.settings.oanda_account_id}/summary")
         account = payload.get("account", {})
         return {
             "balance": float(account.get("balance", 0.0)),
+            "nav": float(account.get("NAV", account.get("balance", 0.0))),
+            "unrealized_pl": float(account.get("unrealizedPL", 0.0)),
+            "margin_used": float(account.get("marginUsed", 0.0)),
+            "margin_available": float(account.get("marginAvailable", 0.0)),
             "currency": str(account.get("currency", "USD")),
         }
 
@@ -135,10 +152,19 @@ class OandaClient:
         payload = self._get(f"/v3/accounts/{self.settings.oanda_account_id}/openPositions")
         return list(payload.get("positions", []))
 
-    def list_open_trades(self) -> list[dict]:
-        if self.settings.execution_mode in {"signal_only", "paper"} or not self.settings.oanda_account_id:
+    def list_open_trades(self, *, force_broker: bool = False) -> list[dict]:
+        if ((not force_broker) and self.settings.execution_mode in {"signal_only", "paper"}) or not self.settings.oanda_account_id:
             return []
-        payload = self._get(f"/v3/accounts/{self.settings.oanda_account_id}/openTrades")
+        if force_broker:
+            response = requests.get(
+                f"{self.api_url}/v3/accounts/{self.settings.oanda_account_id}/openTrades",
+                headers=self._headers(),
+                timeout=20,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        else:
+            payload = self._get(f"/v3/accounts/{self.settings.oanda_account_id}/openTrades")
         return list(payload.get("trades", []))
 
     def calculate_xau_size(self, risk_amount: float, stop_distance: float, account_currency: str) -> float:
@@ -153,8 +179,8 @@ class OandaClient:
             return 0.0
         return max(1.0, round(risk_amount / per_unit_risk))
 
-    def place_market_order(self, opportunity: Opportunity, size: float) -> dict:
-        quote = self.get_price(self.settings.instrument)
+    def place_market_order(self, opportunity: Opportunity, size: float, *, quote: dict[str, float] | None = None) -> dict:
+        quote = quote or self.get_price(self.settings.instrument)
         self.validate_entry_spread(quote)
         if self.settings.execution_mode in {"signal_only", "paper"}:
             entry_price = quote["ask"] if opportunity.direction == "LONG" else quote["bid"]

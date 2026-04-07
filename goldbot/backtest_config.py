@@ -45,6 +45,11 @@ class GoldBacktestConfig:
     warmup_days: int = 90
     simulated_spread: float = 0.25
     event_file: str = ""
+    walk_forward_train_days: int = 0
+    walk_forward_test_days: int = 0
+    walk_forward_step_days: int = 0
+    monte_carlo_iterations: int = 500
+    monte_carlo_ruin_threshold_pct: float = 25.0
 
     @classmethod
     def from_env(cls, *, now: datetime | None = None) -> "GoldBacktestConfig":
@@ -68,4 +73,9 @@ class GoldBacktestConfig:
             warmup_days=_env_int("GOLD_BACKTEST_WARMUP_DAYS", default=90),
             simulated_spread=_env_float("GOLD_BACKTEST_SIMULATED_SPREAD", default=0.25),
             event_file=_env_text("GOLD_BACKTEST_EVENT_FILE", default=default_event_file),
+            walk_forward_train_days=_env_int("GOLD_BACKTEST_WALK_FORWARD_TRAIN_DAYS", default=0),
+            walk_forward_test_days=_env_int("GOLD_BACKTEST_WALK_FORWARD_TEST_DAYS", default=0),
+            walk_forward_step_days=_env_int("GOLD_BACKTEST_WALK_FORWARD_STEP_DAYS", default=0),
+            monte_carlo_iterations=_env_int("GOLD_BACKTEST_MONTE_CARLO_ITERATIONS", default=500),
+            monte_carlo_ruin_threshold_pct=_env_float("GOLD_BACKTEST_MONTE_CARLO_RUIN_THRESHOLD_PCT", default=25.0),
         )

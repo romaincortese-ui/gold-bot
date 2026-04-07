@@ -16,6 +16,7 @@ from goldbot.indicators import (
     nearest_support_resistance,
 )
 from goldbot.models import CalendarEvent, Opportunity
+from goldbot.volume_oracle import BreakoutVolumeSignal
 
 
 USD_PROXY_COMPONENTS: tuple[tuple[str, float], ...] = (
@@ -32,6 +33,7 @@ def score_macro_breakout(
     df_m15: pd.DataFrame,
     df_h1: pd.DataFrame,
     events: list[CalendarEvent],
+    breakout_volume_signal: BreakoutVolumeSignal | None = None,
 ) -> Opportunity | None:
     if df_m15 is None or df_h1 is None or len(df_m15) < 40 or len(df_h1) < settings.breakout_box_hours + 8:
         return None
@@ -63,8 +65,8 @@ def score_macro_breakout(
     breakout_volume = float(df_m15["volume"].iloc[-1])
     avg_volume = float(df_m15["volume"].iloc[-21:-1].mean()) if len(df_m15) >= 21 else breakout_volume
     volume_ratio = breakout_volume / avg_volume if avg_volume > 0 else 1.0
-
-    if volume_ratio < settings.breakout_min_volume_ratio:
+    volume_confirmation = _confirm_breakout_volume(settings, volume_ratio, breakout_volume_signal)
+    if volume_confirmation is None:
         return None
 
     if last_close > box["high"] + buffer_size and float(recent_closes.min()) > box["high"]:
@@ -80,7 +82,14 @@ def score_macro_breakout(
             take_profit_price=None,
             risk_per_unit=risk,
             rationale=f"Post-news break above {box['high']:.2f} after {latest_event.title}",
-            metadata={"event": latest_event.title, "box_high": box["high"], "box_low": box["low"], "atr": atr, "volume_ratio": round(volume_ratio, 2)},
+            metadata={
+                "event": latest_event.title,
+                "box_high": box["high"],
+                "box_low": box["low"],
+                "atr": atr,
+                "volume_ratio": round(volume_ratio, 2),
+                **volume_confirmation,
+            },
             exit_plan=_build_exit_plan(settings, "LONG", last_close, risk, atr, timeframe="M15"),
         )
     if last_close < box["low"] - buffer_size and float(recent_closes.max()) < box["low"]:
@@ -96,10 +105,49 @@ def score_macro_breakout(
             take_profit_price=None,
             risk_per_unit=risk,
             rationale=f"Post-news break below {box['low']:.2f} after {latest_event.title}",
-            metadata={"event": latest_event.title, "box_high": box["high"], "box_low": box["low"], "atr": atr, "volume_ratio": round(volume_ratio, 2)},
+            metadata={
+                "event": latest_event.title,
+                "box_high": box["high"],
+                "box_low": box["low"],
+                "atr": atr,
+                "volume_ratio": round(volume_ratio, 2),
+                **volume_confirmation,
+            },
             exit_plan=_build_exit_plan(settings, "SHORT", last_close, risk, atr, timeframe="M15"),
         )
     return None
+
+
+def _confirm_breakout_volume(
+    settings: Settings,
+    tick_volume_ratio: float,
+    breakout_volume_signal: BreakoutVolumeSignal | None,
+) -> dict[str, float | str | None] | None:
+    external_ratio = breakout_volume_signal.volume_ratio if breakout_volume_signal is not None else None
+    external_source = breakout_volume_signal.source if breakout_volume_signal is not None else None
+
+    if settings.breakout_volume_mode == "tick":
+        if tick_volume_ratio < settings.breakout_min_volume_ratio:
+            return None
+        return {
+            "tick_volume_ratio": round(tick_volume_ratio, 2),
+            "external_volume_ratio": None,
+            "volume_confirmation": "tick",
+            "external_volume_source": None,
+        }
+
+    if external_ratio is None or external_ratio < settings.breakout_external_min_volume_ratio:
+        return None
+
+    if settings.breakout_volume_mode == "hybrid" and tick_volume_ratio < settings.breakout_min_volume_ratio:
+        return None
+
+    return {
+        "tick_volume_ratio": round(tick_volume_ratio, 2),
+        "external_volume_ratio": round(external_ratio, 2),
+        "volume_confirmation": settings.breakout_volume_mode,
+        "external_volume_source": external_source,
+    }
 
 
 def score_exhaustion_reversal(settings: Settings, df_h4: pd.DataFrame, df_d1: pd.DataFrame) -> Opportunity | None:

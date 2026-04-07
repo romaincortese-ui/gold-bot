@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,62 @@ def build_report(equity_curve: list[dict[str, Any]], trades: list[dict[str, Any]
         "expectancy": float(pnl.mean()),
         "max_drawdown": max_drawdown,
         "by_strategy": by_strategy,
+    }
+
+
+def build_monte_carlo_report(
+    trades: list[dict[str, Any]],
+    *,
+    initial_balance: float,
+    iterations: int,
+    ruin_threshold_pct: float,
+    seed: int = 42,
+) -> dict[str, Any]:
+    if iterations <= 0 or not trades:
+        return {
+            "iterations": max(0, iterations),
+            "risk_of_ruin": 0.0,
+            "median_total_pnl": 0.0,
+            "p05_total_pnl": 0.0,
+            "p95_total_pnl": 0.0,
+            "median_max_drawdown": 0.0,
+        }
+
+    pnl_values = [float(trade.get("pnl", 0.0) or 0.0) for trade in trades]
+    ruin_floor = initial_balance * (1.0 - (ruin_threshold_pct / 100.0))
+    rng = random.Random(seed)
+    total_pnls: list[float] = []
+    max_drawdowns: list[float] = []
+    ruined_paths = 0
+
+    for _ in range(iterations):
+        sample = pnl_values[:]
+        rng.shuffle(sample)
+        equity = float(initial_balance)
+        peak = float(initial_balance)
+        max_drawdown = 0.0
+        ruined = False
+        for pnl in sample:
+            equity += pnl
+            peak = max(peak, equity)
+            if peak > 0:
+                max_drawdown = min(max_drawdown, (equity - peak) / peak)
+            if equity <= ruin_floor:
+                ruined = True
+        if ruined:
+            ruined_paths += 1
+        total_pnls.append(equity - initial_balance)
+        max_drawdowns.append(max_drawdown)
+
+    totals = pd.Series(total_pnls, dtype=float)
+    drawdowns = pd.Series(max_drawdowns, dtype=float)
+    return {
+        "iterations": int(iterations),
+        "risk_of_ruin": float(ruined_paths / iterations),
+        "median_total_pnl": float(totals.median()),
+        "p05_total_pnl": float(totals.quantile(0.05)),
+        "p95_total_pnl": float(totals.quantile(0.95)),
+        "median_max_drawdown": float(drawdowns.median()),
     }
 
 

@@ -4,6 +4,7 @@ import pandas as pd
 
 from goldbot.backtest_config import GoldBacktestConfig
 from goldbot.backtest_engine import GoldBacktestEngine
+from goldbot.backtest_reporter import build_monte_carlo_report
 from goldbot.config import Settings
 from goldbot.models import Opportunity
 
@@ -38,7 +39,7 @@ class StubProvider:
 
 
 class StubEngine(GoldBacktestEngine):
-    def _score_at_time(self, timestamp, frames, usd_proxy_frames, events, session_name):
+    def _score_at_time(self, timestamp, frames, usd_proxy_frames, events, session_name, real_yield_frame=None):
         if session_name == "ASIA":
             return None
         return Opportunity(
@@ -212,3 +213,37 @@ def test_backtest_engine_stopout_cooldown_blocks_immediate_reentry() -> None:
     assert equity_curve
     assert len(trades) == 1
     assert trades[0]["exit_reason"] == "STOP_LOSS"
+
+
+def test_backtest_engine_walk_forward_returns_windows() -> None:
+    settings = build_settings()
+    config = GoldBacktestConfig(
+        start=datetime(2026, 4, 1, 0, 0, tzinfo=timezone.utc),
+        end=datetime(2026, 4, 6, 16, 0, tzinfo=timezone.utc),
+        initial_balance=10_000.0,
+        simulated_spread=0.0,
+    )
+    engine = StubEngine(settings, config, StubProvider(build_frames()))
+
+    report = engine.run_walk_forward(train_days=2, test_days=1, step_days=1)
+
+    assert report["windows_evaluated"] >= 1
+    assert report["aggregate_test_report"]["total_trades"] >= 1
+
+
+def test_build_monte_carlo_report_summarizes_sequence_risk() -> None:
+    report = build_monte_carlo_report(
+        [
+            {"pnl": 120.0},
+            {"pnl": -80.0},
+            {"pnl": 40.0},
+            {"pnl": -20.0},
+        ],
+        initial_balance=10_000.0,
+        iterations=200,
+        ruin_threshold_pct=10.0,
+        seed=7,
+    )
+
+    assert report["iterations"] == 200
+    assert 0.0 <= report["risk_of_ruin"] <= 1.0
