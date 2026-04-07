@@ -54,6 +54,30 @@ def test_build_recent_events_message_uses_latest_events(tmp_path) -> None:
     assert "Moved stop" in message
 
 
+def test_status_message_labels_paper_balance_in_signal_only_mode(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    client = GoldTelegramClient(
+        token="token",
+        chat_id="123",
+        state_path=tmp_path / "state.json",
+        offset_path=tmp_path / "telegram_state.json",
+    )
+    client._load_broker_snapshot = lambda: None
+    message = client._build_status_message(
+        {
+            "last_run_at": "2026-04-07T08:22:00+00:00",
+            "last_session": "LONDON",
+            "skip_reason": "no_signal",
+            "paused": False,
+            "open_trades": [],
+            "account_balance": 10000.0,
+            "account_currency": "GBP",
+        }
+    )
+
+    assert "💰 Balance: GBP10,000.00 (paper)" in message
+
+
 def test_handle_unknown_command_returns_help(tmp_path) -> None:
     client = GoldTelegramClient(
         token="token",
@@ -193,3 +217,19 @@ def test_status_message_surfaces_worker_error(tmp_path, monkeypatch) -> None:
 
     assert "🤖 Worker: 🔴 Error" in message
     assert "⚠️ Worker error: boom" in message
+
+
+def test_status_message_surfaces_broker_snapshot_error(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    client = GoldTelegramClient(
+        token="token",
+        chat_id="123",
+        state_path=tmp_path / "state.json",
+        offset_path=tmp_path / "telegram_state.json",
+    )
+    client._load_broker_snapshot = lambda: None
+    client.last_broker_snapshot_error = "Telegram service missing OANDA credentials"
+
+    message = client._build_status_message({"events": [], "signals": [], "open_trades": [], "paused": False})
+
+    assert "⚠️ Broker snapshot: Telegram service missing OANDA credentials" in message

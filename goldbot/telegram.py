@@ -53,6 +53,7 @@ class GoldTelegramClient:
         self.status_ttl = int(os.getenv("GOLD_STATUS_TTL", "1800"))
         self.budget = SharedBudgetManager(self.settings)
         self.marketdata = OandaClient(self.settings)
+        self.last_broker_snapshot_error: str | None = None
 
     def run_forever(self, *, poll_seconds: int, heartbeat_minutes: int) -> None:
         self.send_message("Gold Telegram worker online. Use /help for commands.")
@@ -178,13 +179,16 @@ class GoldTelegramClient:
 
     def _load_broker_snapshot(self) -> dict | None:
         if not self.settings.oanda_api_key or not self.settings.oanda_account_id:
+            self.last_broker_snapshot_error = "Telegram service missing OANDA credentials"
             return None
         try:
             account = self.marketdata.get_account_summary(force_broker=True)
             trades = self.marketdata.list_open_trades(force_broker=True)
         except Exception as exc:
+            self.last_broker_snapshot_error = f"Broker snapshot unavailable: {exc}"
             log.warning("Gold telegram broker snapshot unavailable: %s", exc)
             return None
+        self.last_broker_snapshot_error = None
         gold_trades = [trade for trade in trades if str(trade.get("instrument", "")).upper() == self.settings.instrument]
         gold_unrealized = sum(float(trade.get("unrealizedPL", 0.0) or 0.0) for trade in gold_trades)
         return {
@@ -196,6 +200,7 @@ class GoldTelegramClient:
             "currency": account.get("currency") or "GBP",
             "gold_open_trades": len(gold_trades),
             "gold_unrealized_pl": gold_unrealized,
+            "balance_source": "broker",
         }
 
     def _runtime_snapshot(self, state: dict) -> dict:
@@ -213,6 +218,7 @@ class GoldTelegramClient:
             "open_trade_count": int(runtime_status.get("open_trades", len(state.get("open_trades", []))) or 0),
             "balance": state_balance if state_balance is not None else runtime_status.get("balance"),
             "account_currency": state_currency or runtime_status.get("account_currency") or "GBP",
+            "balance_source": "paper" if self.settings.execution_mode in {"signal_only", "paper"} else "runtime",
         }
 
     @staticmethod
@@ -340,6 +346,7 @@ class GoldTelegramClient:
         broker = self._load_broker_snapshot()
         currency = (broker or {}).get("currency") or snapshot["account_currency"] or "GBP"
         balance = (broker or {}).get("balance", snapshot["balance"])
+        balance_source = (broker or {}).get("balance_source") or snapshot.get("balance_source")
         nav = (broker or {}).get("nav")
         unrealized = (broker or {}).get("unrealized_pl")
         gold_unrealized = (broker or {}).get("gold_unrealized_pl")
@@ -362,7 +369,12 @@ class GoldTelegramClient:
         if nav is not None:
             lines.append(f"NAV: {escape(self._format_currency(nav, currency))}")
         if balance is not None:
-            lines.append(f"💰 Balance: {escape(self._format_currency(balance, currency))}")
+            balance_line = f"💰 Balance: {escape(self._format_currency(balance, currency))}"
+            if balance_source == "paper":
+                balance_line += " (paper)"
+            elif balance_source == "runtime":
+                balance_line += " (runtime snapshot)"
+            lines.append(balance_line)
         if unrealized is not None:
             unrealized_text = escape(self._format_currency(unrealized, currency))
             if gold_unrealized is not None:
@@ -386,6 +398,8 @@ class GoldTelegramClient:
         )
         if snapshot.get("worker_error"):
             lines.append(f"⚠️ Worker error: {escape(str(snapshot['worker_error']))}")
+        if self.last_broker_snapshot_error:
+            lines.append(f"⚠️ Broker snapshot: {escape(self.last_broker_snapshot_error)}")
         last_signal = state.get("last_signal")
         if isinstance(last_signal, dict) and last_signal:
             strategy = escape(str(last_signal.get("strategy", "unknown")))
