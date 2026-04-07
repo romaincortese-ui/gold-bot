@@ -51,6 +51,11 @@ class GoldBotRuntime:
         self.last_heartbeat_at = 0.0
 
     def run_forever(self) -> None:
+        bootstrap_state = self._load_state()
+        bootstrap_state.setdefault("last_run_at", None)
+        bootstrap_state.setdefault("last_session", None)
+        bootstrap_state.setdefault("skip_reason", None)
+        self._publish_runtime_status("booting", bootstrap_state, balance=bootstrap_state.get("account_balance"))
         while True:
             try:
                 self.run_cycle()
@@ -58,6 +63,11 @@ class GoldBotRuntime:
                 raise
             except Exception as exc:
                 log.exception("Gold-bot cycle failed: %s", exc)
+                state = self._load_state()
+                self._record_event(state, "runtime_error", f"Gold-bot cycle failed: {exc}", now=datetime.now(timezone.utc))
+                state["last_error"] = str(exc)
+                self._save_state(state)
+                self._publish_runtime_status("error", state, balance=state.get("account_balance"))
             time.sleep(self.settings.poll_interval_seconds)
 
     def run_cycle(self) -> dict | None:
@@ -610,6 +620,7 @@ class GoldBotRuntime:
             last_run_at=state.get("last_run_at"),
             last_session=state.get("last_session"),
             skip_reason=state.get("skip_reason"),
+            error=state.get("last_error"),
         )
         self._maybe_send_heartbeat(state_name, state, balance)
 

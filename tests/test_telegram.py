@@ -151,7 +151,8 @@ def test_heartbeat_prefers_runtime_status_when_state_is_stale(tmp_path) -> None:
     assert "Open trades: 2" in message
 
 
-def test_status_message_uses_file_backed_runtime_status_when_redis_missing(tmp_path) -> None:
+def test_status_message_uses_file_backed_runtime_status_when_redis_missing(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("REDIS_URL", raising=False)
     client = GoldTelegramClient(
         token="token",
         chat_id="123",
@@ -171,3 +172,24 @@ def test_status_message_uses_file_backed_runtime_status_when_redis_missing(tmp_p
 
     assert "🤖 Worker: 🟢 Idle" in message
     assert "💓 Worker heartbeat: Today at 06:58 UTC" in message
+
+
+def test_status_message_surfaces_worker_error(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    client = GoldTelegramClient(
+        token="token",
+        chat_id="123",
+        state_path=tmp_path / "state.json",
+        offset_path=tmp_path / "telegram_state.json",
+    )
+    client.bot_status_path = tmp_path / "gold_bot_runtime_status.json"
+    client.bot_status_path.write_text(
+        '{\n  "state": "error",\n  "generated_at": "2026-04-07T07:10:00+00:00",\n  "error": "boom"\n}',
+        encoding="utf-8",
+    )
+    client._load_broker_snapshot = lambda: None
+
+    message = client._build_status_message({"events": [], "signals": [], "open_trades": [], "paused": False})
+
+    assert "🤖 Worker: 🔴 Error" in message
+    assert "⚠️ Worker error: boom" in message

@@ -27,7 +27,14 @@ def get_redis_client():
     if _redis_client is not None and _redis_url == redis_url:
         return _redis_client
     try:
-        _redis_client = redis.from_url(redis_url)
+        _redis_client = redis.from_url(
+            redis_url,
+            socket_connect_timeout=5,
+            socket_timeout=5,
+            health_check_interval=30,
+            retry_on_timeout=True,
+        )
+        _redis_client.ping()
         _redis_url = redis_url
         return _redis_client
     except Exception:

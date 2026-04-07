@@ -208,6 +208,7 @@ class GoldTelegramClient:
             "last_run_at": runtime_status.get("last_run_at") or state.get("last_run_at"),
             "last_session": runtime_status.get("last_session") or state.get("last_session"),
             "skip_reason": runtime_status.get("skip_reason") or state.get("skip_reason"),
+            "worker_error": runtime_status.get("error") or state.get("last_error"),
             "paused": runtime_status.get("paused") if "paused" in runtime_status else bool(state.get("paused", False)),
             "open_trade_count": int(runtime_status.get("open_trades", len(state.get("open_trades", []))) or 0),
             "balance": state_balance if state_balance is not None else runtime_status.get("balance"),
@@ -298,8 +299,10 @@ class GoldTelegramClient:
             return "🟠 No heartbeat" if has_recent_run else "🔴 Offline"
         name = str(state_name).strip().lower()
         labels = {
+            "booting": "🟡 Booting",
             "idle": "🟢 Idle",
             "paused": "⏸️ Paused",
+            "error": "🔴 Error",
             "trade_opened": "🟢 Trade opened",
             "active_trade": "🟢 Managing trade",
             "scanning": "🟢 Scanning",
@@ -381,6 +384,8 @@ class GoldTelegramClient:
                 f"⏭️ Last skip: {self._format_reason(snapshot['skip_reason'])}",
             ]
         )
+        if snapshot.get("worker_error"):
+            lines.append(f"⚠️ Worker error: {escape(str(snapshot['worker_error']))}")
         last_signal = state.get("last_signal")
         if isinstance(last_signal, dict) and last_signal:
             strategy = escape(str(last_signal.get("strategy", "unknown")))

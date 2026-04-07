@@ -307,3 +307,28 @@ def test_run_cycle_scales_risk_when_real_yields_are_adverse(tmp_path, monkeypatc
     saved = json.loads(runtime.state_path.read_text(encoding="utf-8"))
 
     assert saved["last_signal"]["risk_amount"] == 18.75
+
+
+def test_run_forever_publishes_error_status_on_cycle_failure(monkeypatch) -> None:
+    _disable_redis(monkeypatch)
+    runtime = GoldBotRuntime()
+    published: list[str] = []
+
+    monkeypatch.setattr(runtime, "run_cycle", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(runtime, "_publish_runtime_status", lambda state_name, state, balance=None: published.append(state_name))
+
+    calls = {"count": 0}
+
+    def fake_sleep(seconds: int) -> None:
+        calls["count"] += 1
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr("goldbot.runtime.time.sleep", fake_sleep)
+
+    try:
+        runtime.run_forever()
+    except KeyboardInterrupt:
+        pass
+
+    assert published[0] == "booting"
+    assert "error" in published
