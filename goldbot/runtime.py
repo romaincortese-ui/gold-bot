@@ -23,6 +23,7 @@ from goldbot.strategies import (
     score_trend_pullback,
     select_best_opportunity,
 )
+from goldbot.telegram import GoldTelegramClient
 from goldbot.volume_oracle import load_breakout_volume_signal
 
 
@@ -47,8 +48,12 @@ class GoldBotRuntime:
         self.status_ttl = int(os.getenv("GOLD_STATUS_TTL", "1800"))
         self.telegram_token = os.getenv("GOLD_TELEGRAM_TOKEN", "").strip()
         self.telegram_chat_id = os.getenv("GOLD_TELEGRAM_CHAT_ID", "").strip()
+        self.telegram_poll_seconds = max(1, int(os.getenv("GOLD_TELEGRAM_POLL_SECONDS", "5")))
+        self.telegram_status_heartbeat_minutes = max(0, int(os.getenv("GOLD_TELEGRAM_HEARTBEAT_MINUTES", "60")))
+        self.telegram_offset_path = Path(os.getenv("GOLD_TELEGRAM_OFFSET_FILE", "telegram_state.json"))
         self.heartbeat_interval = int(os.getenv("GOLD_HEARTBEAT_INTERVAL", "3600"))
         self.last_heartbeat_at = 0.0
+        self.telegram_client = self._build_telegram_client()
 
     def run_forever(self) -> None:
         bootstrap_state = self._load_state()
@@ -56,9 +61,19 @@ class GoldBotRuntime:
         bootstrap_state.setdefault("last_session", None)
         bootstrap_state.setdefault("skip_reason", None)
         self._publish_runtime_status("booting", bootstrap_state, balance=bootstrap_state.get("account_balance"))
+        self._announce_telegram_startup()
+        next_cycle_at = time.monotonic()
+        next_telegram_at = time.monotonic() if self.telegram_client is not None else float("inf")
         while True:
             try:
-                self.run_cycle()
+                now = time.monotonic()
+                if now >= next_telegram_at:
+                    self._service_telegram()
+                    next_telegram_at = time.monotonic() + self.telegram_poll_seconds
+                    now = time.monotonic()
+                if now >= next_cycle_at:
+                    self.run_cycle()
+                    next_cycle_at = time.monotonic() + self.settings.poll_interval_seconds
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
@@ -68,7 +83,36 @@ class GoldBotRuntime:
                 state["last_error"] = str(exc)
                 self._save_state(state)
                 self._publish_runtime_status("error", state, balance=state.get("account_balance"))
-            time.sleep(self.settings.poll_interval_seconds)
+                next_cycle_at = time.monotonic() + self.settings.poll_interval_seconds
+            sleep_until = min(next_cycle_at, next_telegram_at)
+            sleep_seconds = max(0.2, sleep_until - time.monotonic())
+            time.sleep(min(sleep_seconds, float(self.telegram_poll_seconds)))
+
+    def _build_telegram_client(self) -> GoldTelegramClient | None:
+        if not self.telegram_token or not self.telegram_chat_id:
+            return None
+        return GoldTelegramClient(
+            token=self.telegram_token,
+            chat_id=self.telegram_chat_id,
+            state_path=self.state_path,
+            offset_path=self.telegram_offset_path,
+        )
+
+    def _announce_telegram_startup(self) -> None:
+        if self.telegram_client is None:
+            return
+        try:
+            self.telegram_client.announce_startup()
+        except Exception as exc:
+            log.exception("Gold Telegram startup announcement failed: %s", exc)
+
+    def _service_telegram(self) -> None:
+        if self.telegram_client is None:
+            return
+        try:
+            self.telegram_client.service_once(heartbeat_minutes=self.telegram_status_heartbeat_minutes)
+        except Exception as exc:
+            log.exception("Gold Telegram service failed: %s", exc)
 
     def run_cycle(self) -> dict | None:
         now = datetime.now(timezone.utc)

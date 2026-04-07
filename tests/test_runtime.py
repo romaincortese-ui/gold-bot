@@ -334,6 +334,61 @@ def test_run_forever_publishes_error_status_on_cycle_failure(monkeypatch) -> Non
     assert "error" in published
 
 
+def test_run_forever_polls_embedded_telegram_between_trade_cycles(monkeypatch) -> None:
+    _disable_redis(monkeypatch)
+    runtime = GoldBotRuntime()
+    runtime.telegram_client = object()
+    runtime.telegram_poll_seconds = 5
+    runtime.settings = type(runtime.settings)(
+        **{
+            **runtime.settings.__dict__,
+            "poll_interval_seconds": 20,
+        }
+    )
+
+    telegram_calls: list[str] = []
+    cycle_calls: list[str] = []
+    monotonic_values = iter([0, 0, 0, 0, 0, 0, 1, 5, 5, 5, 6, 10, 10, 10, 11, 20, 20, 20])
+
+    monkeypatch.setattr(runtime, "_publish_runtime_status", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime, "_announce_telegram_startup", lambda: None)
+    monkeypatch.setattr(runtime, "_service_telegram", lambda: telegram_calls.append("telegram"))
+
+    def fake_run_cycle() -> None:
+        cycle_calls.append("cycle")
+        if len(cycle_calls) >= 2:
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(runtime, "run_cycle", fake_run_cycle)
+    monkeypatch.setattr("goldbot.runtime.time.monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr("goldbot.runtime.time.sleep", lambda seconds: None)
+
+    try:
+        runtime.run_forever()
+    except KeyboardInterrupt:
+        pass
+
+    assert cycle_calls == ["cycle", "cycle"]
+    assert telegram_calls == ["telegram", "telegram", "telegram", "telegram"]
+
+
+def test_service_telegram_uses_embedded_client_heartbeat_minutes(monkeypatch) -> None:
+    _disable_redis(monkeypatch)
+    runtime = GoldBotRuntime()
+    calls: list[int] = []
+
+    class StubTelegramClient:
+        def service_once(self, *, heartbeat_minutes: int) -> None:
+            calls.append(heartbeat_minutes)
+
+    runtime.telegram_client = StubTelegramClient()
+    runtime.telegram_status_heartbeat_minutes = 17
+
+    runtime._service_telegram()
+
+    assert calls == [17]
+
+
 def test_run_cycle_publishes_account_snapshot_fields(tmp_path, monkeypatch) -> None:
     _disable_redis(monkeypatch)
     runtime = GoldBotRuntime()

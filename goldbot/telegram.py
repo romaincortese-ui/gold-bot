@@ -22,19 +22,9 @@ log = logging.getLogger(__name__)
 
 
 def run_telegram_bot() -> None:
-    token = os.getenv("GOLD_TELEGRAM_TOKEN", "").strip()
-    chat_id = os.getenv("GOLD_TELEGRAM_CHAT_ID", "").strip()
-    poll_seconds = int(os.getenv("GOLD_TELEGRAM_POLL_SECONDS", "5"))
-    heartbeat_minutes = int(os.getenv("GOLD_TELEGRAM_HEARTBEAT_MINUTES", "60"))
-    offset_path = Path(os.getenv("GOLD_TELEGRAM_OFFSET_FILE", "telegram_state.json"))
-    settings = load_settings()
-    state_path = Path(settings.state_file)
-
-    if not token or not chat_id:
-        raise ValueError("GOLD_TELEGRAM_TOKEN and GOLD_TELEGRAM_CHAT_ID are required for the Telegram worker")
-
-    client = GoldTelegramClient(token=token, chat_id=chat_id, state_path=state_path, offset_path=offset_path)
-    client.run_forever(poll_seconds=poll_seconds, heartbeat_minutes=heartbeat_minutes)
+    raise RuntimeError(
+        "Standalone Gold Telegram service has been removed. Start Gold-bot with python main.py so the worker and Telegram run in one process."
+    )
 
 
 class GoldTelegramClient:
@@ -54,23 +44,33 @@ class GoldTelegramClient:
         self.budget = SharedBudgetManager(self.settings)
         self.marketdata = OandaClient(self.settings)
         self.last_broker_snapshot_error: str | None = None
+        self.last_heartbeat_at = 0.0
+        self.startup_announced = False
 
     def run_forever(self, *, poll_seconds: int, heartbeat_minutes: int) -> None:
-        self.send_message("Gold Telegram worker online. Use /help for commands.")
-        last_heartbeat = 0.0
+        self.announce_startup()
         while True:
             try:
-                self.flush_new_events()
-                self.poll_commands()
-                now = time.time()
-                if heartbeat_minutes > 0 and now - last_heartbeat >= heartbeat_minutes * 60:
-                    self._publish_status("running")
-                    last_heartbeat = now
+                self.service_once(heartbeat_minutes=heartbeat_minutes)
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
                 log.exception("Gold Telegram loop failed: %s", exc)
             time.sleep(max(1, poll_seconds))
+
+    def announce_startup(self) -> None:
+        if self.startup_announced:
+            return
+        self.send_message("Gold Telegram online inside the Gold worker. Use /help for commands.")
+        self.startup_announced = True
+
+    def service_once(self, *, heartbeat_minutes: int) -> None:
+        self.flush_new_events()
+        self.poll_commands()
+        now = time.time()
+        if heartbeat_minutes > 0 and now - self.last_heartbeat_at >= heartbeat_minutes * 60:
+            self._publish_status("running")
+            self.last_heartbeat_at = now
 
     def flush_new_events(self) -> None:
         state = self._load_state()

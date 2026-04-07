@@ -1,7 +1,6 @@
 import os
 
 from goldbot.runtime import GoldBotRuntime
-from goldbot.telegram import run_telegram_bot
 from macro_engine import main as run_macro_engine
 
 
@@ -13,10 +12,7 @@ def main() -> None:
     if role == "macro":
         run_macro_engine()
         return
-    if role == "telegram":
-        run_telegram_bot()
-        return
-    raise ValueError(f"Unsupported GOLD_SERVICE_ROLE: {role}")
+    raise ValueError(f"Unsupported GOLD_SERVICE_ROLE: {role}. Supported roles are worker and macro.")
 
 
 if __name__ == "__main__":

@@ -6,11 +6,10 @@ Gold-bot is a dedicated XAU/USD bot for the same OANDA account used by the FX bo
 
 - `main.py`: live runtime loop
 - `macro_engine.py`: red-folder event snapshot builder for gold
-- `run_telegram_bot.py`: separate Telegram worker entrypoint
 - `goldbot/config.py`: environment parsing and validation
 - `goldbot/marketdata.py`: OANDA account, pricing, candles, and order calls
 - `goldbot/news.py`: economic-calendar fetch and filtering for gold-relevant USD events
-- `goldbot/telegram.py`: Telegram polling worker for runtime alerts and commands
+- `goldbot/telegram.py`: Telegram polling client embedded inside the live worker for runtime alerts and commands
 - `goldbot/indicators.py`: EMA, RSI, MACD, ATR, divergence, candlestick helpers, consolidation boxes
 - `goldbot/strategies.py`: three XAU/USD strategy evaluators
 - `goldbot/budget.py`: shared-sleeve budget tracking with 50% FX / 50% Gold allocation
@@ -123,7 +122,6 @@ Files:
 python -m pip install -r requirements.txt
 python run_macro_engine.py
 python main.py
-python run_telegram_bot.py
 ```
 
 ## Backtesting
@@ -187,19 +185,18 @@ For larger comparison runs, use `_run_gold_sweep.py` to rank parameter profiles 
 
 ## Railway Layout
 
-Use separate Railway services or workers for the Gold stack:
+Use two Railway services or workers for the Gold stack:
 
 - `worker`: `python main.py`
 - `macro`: `python run_macro_engine.py`
-- `telegram`: `python run_telegram_bot.py`
 
 The included [Gold-bot/Procfile](Gold-bot/Procfile) and [Gold-bot/Dockerfile](Gold-bot/Dockerfile) support that layout directly.
 
-For GitHub-backed Railway services, the repo also includes [Gold-bot/railway_entrypoint.py](Gold-bot/railway_entrypoint.py). All three services can use the same image/start command and select behavior via `GOLD_SERVICE_ROLE=worker|macro|telegram`.
+For GitHub-backed Railway services, the repo also includes [Gold-bot/railway_entrypoint.py](Gold-bot/railway_entrypoint.py). Both services can use the same image/start command and select behavior via `GOLD_SERVICE_ROLE=worker|macro`.
 
-For local runs the services can share [Gold-bot/state.json](Gold-bot/state.json). For separate Railway services, set `REDIS_URL` so the runtime state, pause/resume controls, runtime-status heartbeats, and shared budget all move onto Redis.
+For local runs the services can share [Gold-bot/state.json](Gold-bot/state.json). For separate Railway services, set `REDIS_URL` so the runtime state, runtime-status heartbeats, and shared budget all move onto Redis.
 
-The Telegram worker reads runtime events and open-trade status from the shared Gold state and supports these commands:
+The worker owns Telegram polling directly and supports these commands:
 
 - `/help`
 - `/status`
@@ -212,10 +209,10 @@ The Telegram worker reads runtime events and open-trade status from the shared G
 - `/sync`
 - `/closeall`
 
-`/pause`, `/resume`, `/sync`, and `/closeall` are queued into shared runtime state and executed by the trading runtime on its next cycle. That keeps all broker-affecting actions in one process even when Telegram runs as a separate Railway service.
+`/pause`, `/resume`, `/sync`, and `/closeall` are still queued into runtime state and executed by the trading runtime on its next cycle. That keeps all broker-affecting actions in one process while removing the extra Telegram deployment and its shared-state failure mode.
 
 ## Notes
 
-- `EXECUTION_MODE=signal_only` is the safest default while you verify OANDA contract sizing for your spread-bet account and bring up the separate Gold Telegram bot and Railway worker.
+- `EXECUTION_MODE=signal_only` is the safest default while you verify OANDA contract sizing for your spread-bet account and bring up the Gold worker and macro services.
 - If you later want stricter cross-bot budget coordination, the FX bot can publish its reserved risk into the same `shared_budget_state.json` file under the `fx` key without changing Gold-bot's runtime contract.
-- Runtime events now include entry opens, spread-blocked executions, partial profits, break-even moves, trailing-stop updates, and tracked closures so the Telegram worker can notify independently from the trading runtime.
+- Runtime events now include entry opens, spread-blocked executions, partial profits, break-even moves, trailing-stop updates, and tracked closures so the embedded Telegram client can notify from the same process that owns trading state.
