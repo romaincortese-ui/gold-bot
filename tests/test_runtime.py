@@ -332,3 +332,40 @@ def test_run_forever_publishes_error_status_on_cycle_failure(monkeypatch) -> Non
 
     assert published[0] == "booting"
     assert "error" in published
+
+
+def test_run_cycle_publishes_account_snapshot_fields(tmp_path, monkeypatch) -> None:
+    _disable_redis(monkeypatch)
+    runtime = GoldBotRuntime()
+    runtime.state_path = tmp_path / "state.json"
+    runtime._save_state({"signals": [], "open_trades": [], "events": []})
+
+    monkeypatch.setattr(runtime, "_session_name", lambda now: "LONDON")
+    monkeypatch.setattr(
+        runtime.client,
+        "get_account_summary",
+        lambda: {
+            "balance": 12000.0,
+            "nav": 12125.0,
+            "unrealized_pl": 125.0,
+            "margin_used": 210.0,
+            "margin_available": 11915.0,
+            "currency": "GBP",
+        },
+    )
+    monkeypatch.setattr(runtime.client, "fetch_candles", lambda instrument, granularity, count: __import__("pandas").DataFrame([{"time": datetime.now(timezone.utc), "open": 3000.0, "high": 3001.0, "low": 2999.0, "close": 3000.5, "volume": 100}] * 260))
+    monkeypatch.setattr("goldbot.runtime.fetch_calendar_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr("goldbot.runtime.filter_gold_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr("goldbot.runtime.score_macro_breakout", lambda *args, **kwargs: None)
+    monkeypatch.setattr("goldbot.runtime.score_exhaustion_reversal", lambda *args, **kwargs: None)
+    monkeypatch.setattr("goldbot.runtime.score_trend_pullback", lambda *args, **kwargs: None)
+
+    runtime.run_cycle()
+    saved = json.loads(runtime.state_path.read_text(encoding="utf-8"))
+
+    assert saved["account_balance"] == 12000.0
+    assert saved["account_nav"] == 12125.0
+    assert saved["account_unrealized_pl"] == 125.0
+    assert saved["account_margin_used"] == 210.0
+    assert saved["account_margin_available"] == 11915.0
+    assert saved["execution_mode"] == runtime.settings.execution_mode

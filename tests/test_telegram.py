@@ -227,9 +227,23 @@ def test_status_message_surfaces_broker_snapshot_error(tmp_path, monkeypatch) ->
         state_path=tmp_path / "state.json",
         offset_path=tmp_path / "telegram_state.json",
     )
-    client._load_broker_snapshot = lambda: None
-    client.last_broker_snapshot_error = "Telegram service missing OANDA credentials"
+    message = client._build_status_message(
+        {
+            "events": [],
+            "signals": [],
+            "open_trades": [],
+            "paused": False,
+            "account_balance": 11000.0,
+            "account_nav": 11120.0,
+            "account_unrealized_pl": 120.0,
+            "account_margin_used": 220.0,
+            "account_margin_available": 10880.0,
+            "account_currency": "GBP",
+            "execution_mode": "live",
+        }
+    )
 
-    message = client._build_status_message({"events": [], "signals": [], "open_trades": [], "paused": False})
-
-    assert "⚠️ Broker snapshot: Telegram service missing OANDA credentials" in message
+    assert "NAV: GBP11,120.00" in message
+    assert "📉 Unrealized: GBP120.00" in message
+    assert "Margin used: GBP220.00" in message
+    assert "Margin available: GBP10,880.00" in message

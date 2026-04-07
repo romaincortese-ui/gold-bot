@@ -177,36 +177,11 @@ class GoldTelegramClient:
             "/closeall - Queue close-all"
         )
 
-    def _load_broker_snapshot(self) -> dict | None:
-        if not self.settings.oanda_api_key or not self.settings.oanda_account_id:
-            self.last_broker_snapshot_error = "Telegram service missing OANDA credentials"
-            return None
-        try:
-            account = self.marketdata.get_account_summary(force_broker=True)
-            trades = self.marketdata.list_open_trades(force_broker=True)
-        except Exception as exc:
-            self.last_broker_snapshot_error = f"Broker snapshot unavailable: {exc}"
-            log.warning("Gold telegram broker snapshot unavailable: %s", exc)
-            return None
-        self.last_broker_snapshot_error = None
-        gold_trades = [trade for trade in trades if str(trade.get("instrument", "")).upper() == self.settings.instrument]
-        gold_unrealized = sum(float(trade.get("unrealizedPL", 0.0) or 0.0) for trade in gold_trades)
-        return {
-            "balance": account.get("balance"),
-            "nav": account.get("nav"),
-            "unrealized_pl": account.get("unrealized_pl"),
-            "margin_used": account.get("margin_used"),
-            "margin_available": account.get("margin_available"),
-            "currency": account.get("currency") or "GBP",
-            "gold_open_trades": len(gold_trades),
-            "gold_unrealized_pl": gold_unrealized,
-            "balance_source": "broker",
-        }
-
     def _runtime_snapshot(self, state: dict) -> dict:
         runtime_status = load_runtime_status(self.bot_status_key, str(self.bot_status_path)) or {}
         state_balance = state.get("account_balance")
         state_currency = state.get("account_currency")
+        execution_mode = runtime_status.get("execution_mode") or state.get("execution_mode") or self.settings.execution_mode
         return {
             "worker_state": runtime_status.get("state"),
             "worker_heartbeat": runtime_status.get("generated_at"),
@@ -217,8 +192,13 @@ class GoldTelegramClient:
             "paused": runtime_status.get("paused") if "paused" in runtime_status else bool(state.get("paused", False)),
             "open_trade_count": int(runtime_status.get("open_trades", len(state.get("open_trades", []))) or 0),
             "balance": state_balance if state_balance is not None else runtime_status.get("balance"),
+            "nav": runtime_status.get("nav") if runtime_status.get("nav") is not None else state.get("account_nav"),
+            "unrealized_pl": runtime_status.get("unrealized_pl") if runtime_status.get("unrealized_pl") is not None else state.get("account_unrealized_pl"),
+            "margin_used": runtime_status.get("margin_used") if runtime_status.get("margin_used") is not None else state.get("account_margin_used"),
+            "margin_available": runtime_status.get("margin_available") if runtime_status.get("margin_available") is not None else state.get("account_margin_available"),
             "account_currency": state_currency or runtime_status.get("account_currency") or "GBP",
-            "balance_source": "paper" if self.settings.execution_mode in {"signal_only", "paper"} else "runtime",
+            "execution_mode": execution_mode,
+            "balance_source": "paper" if execution_mode in {"signal_only", "paper"} else "worker",
         }
 
     @staticmethod
@@ -343,16 +323,14 @@ class GoldTelegramClient:
     def _build_status_message(self, state: dict) -> str:
         open_trades = list(state.get("open_trades", []))
         snapshot = self._runtime_snapshot(state)
-        broker = self._load_broker_snapshot()
-        currency = (broker or {}).get("currency") or snapshot["account_currency"] or "GBP"
-        balance = (broker or {}).get("balance", snapshot["balance"])
-        balance_source = (broker or {}).get("balance_source") or snapshot.get("balance_source")
-        nav = (broker or {}).get("nav")
-        unrealized = (broker or {}).get("unrealized_pl")
-        gold_unrealized = (broker or {}).get("gold_unrealized_pl")
-        margin_used = (broker or {}).get("margin_used")
-        margin_available = (broker or {}).get("margin_available")
-        open_trade_count = int((broker or {}).get("gold_open_trades", snapshot["open_trade_count"]))
+        currency = snapshot["account_currency"] or "GBP"
+        balance = snapshot["balance"]
+        balance_source = snapshot.get("balance_source")
+        nav = snapshot.get("nav")
+        unrealized = snapshot.get("unrealized_pl")
+        margin_used = snapshot.get("margin_used")
+        margin_available = snapshot.get("margin_available")
+        open_trade_count = int(snapshot["open_trade_count"])
         budget_snapshot = None
         if balance is not None:
             try:
@@ -376,10 +354,7 @@ class GoldTelegramClient:
                 balance_line += " (runtime snapshot)"
             lines.append(balance_line)
         if unrealized is not None:
-            unrealized_text = escape(self._format_currency(unrealized, currency))
-            if gold_unrealized is not None:
-                unrealized_text += f" | gold {escape(self._format_currency(gold_unrealized, currency))}"
-            lines.append(f"📉 Unrealized: {unrealized_text}")
+            lines.append(f"📉 Unrealized: {escape(self._format_currency(unrealized, currency))}")
         if margin_used is not None:
             lines.append(f"Margin used: {escape(self._format_currency(margin_used, currency))}")
         if margin_available is not None:
@@ -398,8 +373,6 @@ class GoldTelegramClient:
         )
         if snapshot.get("worker_error"):
             lines.append(f"⚠️ Worker error: {escape(str(snapshot['worker_error']))}")
-        if self.last_broker_snapshot_error:
-            lines.append(f"⚠️ Broker snapshot: {escape(self.last_broker_snapshot_error)}")
         last_signal = state.get("last_signal")
         if isinstance(last_signal, dict) and last_signal:
             strategy = escape(str(last_signal.get("strategy", "unknown")))
@@ -478,9 +451,8 @@ class GoldTelegramClient:
 
     def _build_risk_message(self, state: dict) -> str:
         runtime = self._runtime_snapshot(state)
-        broker = self._load_broker_snapshot()
-        currency = (broker or {}).get("currency") or runtime.get("account_currency") or state.get("account_currency") or "GBP"
-        balance = float((broker or {}).get("balance", runtime.get("balance", 0.0)) or 0.0)
+        currency = runtime.get("account_currency") or state.get("account_currency") or "GBP"
+        balance = float(runtime.get("balance", 0.0) or 0.0)
         if balance <= 0:
             return "🛡️ <b>Gold Risk</b>\n━━━━━━━━━━━━━━━\nRisk snapshot unavailable until the Gold runtime publishes account balance."
         snapshot = self.budget.build_snapshot(balance)

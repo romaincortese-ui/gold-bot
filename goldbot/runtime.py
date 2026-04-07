@@ -99,6 +99,11 @@ class GoldBotRuntime:
         snapshot = self.budget.build_snapshot(balance)
         state["account_balance"] = balance
         state["account_currency"] = account_currency
+        state["account_nav"] = float(account.get("nav", balance) or balance)
+        state["account_unrealized_pl"] = float(account.get("unrealized_pl", 0.0) or 0.0)
+        state["account_margin_used"] = float(account.get("margin_used", 0.0) or 0.0)
+        state["account_margin_available"] = float(account.get("margin_available", 0.0) or 0.0)
+        state["execution_mode"] = self.settings.execution_mode
 
         open_gold_trades = list(state.get("open_trades", []))
         if len(open_gold_trades) >= self.settings.max_open_gold_trades:
@@ -615,6 +620,12 @@ class GoldBotRuntime:
             ttl_seconds=self.status_ttl,
             file_path=str(self.status_path),
             balance=balance,
+            nav=state.get("account_nav"),
+            unrealized_pl=state.get("account_unrealized_pl"),
+            margin_used=state.get("account_margin_used"),
+            margin_available=state.get("account_margin_available"),
+            account_currency=state.get("account_currency"),
+            execution_mode=state.get("execution_mode", self.settings.execution_mode),
             paused=bool(state.get("paused", False)),
             open_trades=len(state.get("open_trades", [])),
             last_run_at=state.get("last_run_at"),
