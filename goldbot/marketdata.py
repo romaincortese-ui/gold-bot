@@ -66,10 +66,14 @@ class OandaClient:
         }
 
     def fetch_candles(self, instrument: str, granularity: str, count: int) -> pd.DataFrame | None:
-        payload = self._get(
-            f"/v3/instruments/{instrument}/candles",
-            params={"granularity": granularity, "count": count, "price": "M"},
-        )
+        try:
+            payload = self._get(
+                f"/v3/instruments/{instrument}/candles",
+                params={"granularity": granularity, "count": count, "price": "M"},
+            )
+        except requests.exceptions.RequestException as exc:
+            log.warning("Failed to fetch candles for %s after retries: %s", instrument, exc)
+            return None
         return self._candles_to_frame(candles=payload.get("candles", []), granularity=granularity)
 
     def fetch_candles_range(self, instrument: str, granularity: str, start: datetime, end: datetime) -> pd.DataFrame | None:
@@ -80,15 +84,19 @@ class OandaClient:
 
         while cursor < upper_bound:
             chunk_end = min(upper_bound, cursor + (step * self.MAX_CANDLES_PER_REQUEST))
-            payload = self._get(
-                f"/v3/instruments/{instrument}/candles",
-                params={
-                    "granularity": granularity,
-                    "from": cursor.isoformat().replace("+00:00", "Z"),
-                    "to": chunk_end.isoformat().replace("+00:00", "Z"),
-                    "price": "M",
-                },
-            )
+            try:
+                payload = self._get(
+                    f"/v3/instruments/{instrument}/candles",
+                    params={
+                        "granularity": granularity,
+                        "from": cursor.isoformat().replace("+00:00", "Z"),
+                        "to": chunk_end.isoformat().replace("+00:00", "Z"),
+                        "price": "M",
+                    },
+                )
+            except requests.exceptions.RequestException as exc:
+                log.warning("Failed to fetch candles range for %s after retries: %s", instrument, exc)
+                return None
             candles.extend(payload.get("candles", []))
 
             if chunk_end <= cursor:
