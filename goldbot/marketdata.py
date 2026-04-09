@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -10,6 +11,10 @@ from goldbot.models import Opportunity
 
 
 log = logging.getLogger(__name__)
+
+_TRANSIENT_STATUS_CODES = {502, 503, 504, 429}
+_MAX_RETRIES = 3
+_RETRY_BACKOFF = 2  # seconds, doubles each attempt
 
 
 class SpreadTooWideError(RuntimeError):
@@ -265,9 +270,26 @@ class OandaClient:
     def _get(self, path: str, params: dict | None = None) -> dict:
         if self.settings.execution_mode in {"signal_only", "paper"} and path.startswith("/v3/accounts"):
             return {}
-        response = requests.get(f"{self.api_url}{path}", headers=self._headers(), params=params, timeout=20)
-        response.raise_for_status()
-        return response.json()
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_RETRIES):
+            try:
+                response = requests.get(f"{self.api_url}{path}", headers=self._headers(), params=params, timeout=20)
+                if response.status_code in _TRANSIENT_STATUS_CODES and attempt < _MAX_RETRIES - 1:
+                    wait = _RETRY_BACKOFF * (2 ** attempt)
+                    log.warning("OANDA %s on %s – retry %d/%d in %ds", response.status_code, path, attempt + 1, _MAX_RETRIES, wait)
+                    time.sleep(wait)
+                    continue
+                response.raise_for_status()
+                return response.json()
+            except requests.exceptions.ConnectionError as exc:
+                last_exc = exc
+                if attempt < _MAX_RETRIES - 1:
+                    wait = _RETRY_BACKOFF * (2 ** attempt)
+                    log.warning("OANDA connection error on %s – retry %d/%d in %ds: %s", path, attempt + 1, _MAX_RETRIES, wait, exc)
+                    time.sleep(wait)
+                    continue
+                raise
+        raise last_exc  # type: ignore[misc]
 
     def _post(self, path: str, payload: dict) -> dict:
         response = requests.post(f"{self.api_url}{path}", headers=self._headers(), data=json.dumps(payload), timeout=20)
