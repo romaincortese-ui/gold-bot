@@ -163,7 +163,7 @@ def score_exhaustion_reversal(settings: Settings, df_h4: pd.DataFrame, df_d1: pd
     near_resistance = abs(price - levels["resistance"]) <= atr
     near_support = abs(price - levels["support"]) <= atr
 
-    if divergence["bearish"] and near_resistance and rsi_h4 >= settings.exhaustion_rsi_overbought and macd_h4["histogram"] <= 0:
+    if divergence["bearish"] and near_resistance and rsi_h4 >= settings.exhaustion_rsi_overbought:
         stop_price = levels["resistance"] + atr * 0.5
         risk = stop_price - price
         score = 75 + min(10, max(0.0, rsi_h4 - settings.exhaustion_rsi_overbought))
@@ -180,7 +180,7 @@ def score_exhaustion_reversal(settings: Settings, df_h4: pd.DataFrame, df_d1: pd
             exit_plan=_build_exit_plan(settings, "SHORT", price, risk, atr, timeframe="H1"),
         )
 
-    if divergence["bullish"] and near_support and rsi_h4 <= settings.exhaustion_rsi_oversold and macd_h4["histogram"] >= 0:
+    if divergence["bullish"] and near_support and rsi_h4 <= settings.exhaustion_rsi_oversold:
         stop_price = levels["support"] - atr * 0.5
         risk = price - stop_price
         score = 75 + min(10, max(0.0, settings.exhaustion_rsi_oversold - rsi_h4))
@@ -242,7 +242,7 @@ def score_trend_pullback(
         pullback_gap = abs(support_probe - ema_fast_value)
         if pullback_gap > atr_h4 * settings.trend_pullback_atr_tolerance:
             return None
-        stop_price = min(float(df_h1["low"].tail(5).min()), float(ema_fast.iloc[-1])) - atr_h4 * 0.4
+        stop_price = min(float(df_h1["low"].tail(5).min()), float(ema_fast.iloc[-1])) - atr_h4 * 0.6
         risk = trigger_price - stop_price
         score = 68 + min(18, trend_strength * 6)
         return Opportunity(
@@ -274,7 +274,7 @@ def score_trend_pullback(
         pullback_gap = abs(resistance_probe - ema_fast_value)
         if pullback_gap > atr_h4 * settings.trend_pullback_atr_tolerance:
             return None
-        stop_price = max(float(df_h1["high"].tail(5).max()), float(ema_fast.iloc[-1])) + atr_h4 * 0.4
+        stop_price = max(float(df_h1["high"].tail(5).max()), float(ema_fast.iloc[-1])) + atr_h4 * 0.6
         risk = stop_price - trigger_price
         score = 68 + min(18, trend_strength * 6)
         return Opportunity(
