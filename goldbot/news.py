@@ -7,6 +7,11 @@ from pathlib import Path
 
 import requests
 
+try:
+    from defusedxml.ElementTree import fromstring as safe_fromstring
+except ImportError:
+    safe_fromstring = None
+
 from goldbot.models import CalendarEvent
 
 
@@ -41,7 +46,11 @@ def fetch_calendar_events(urls: list[str], cache_file: str, timeout: int = 20) -
 
 
 def parse_calendar_events(xml_text: str, source: str) -> list[CalendarEvent]:
-    root = ET.fromstring(xml_text)
+    if safe_fromstring is not None:
+        root = safe_fromstring(xml_text)
+    else:
+        parser = ET.XMLParser()
+        root = ET.fromstring(xml_text, parser=parser)  # noqa: S314
     nodes = list(root.findall(".//item")) + list(root.findall(".//event"))
     events: list[CalendarEvent] = []
     for node in nodes:

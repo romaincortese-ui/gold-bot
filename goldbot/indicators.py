@@ -84,7 +84,13 @@ def detect_divergence(df: pd.DataFrame, lookback: int = 40) -> dict[str, bool]:
         return {"bullish": False, "bearish": False}
 
     close = window["close"]
-    rsi_series = close.rolling(14).apply(lambda values: calc_rsi(pd.Series(values)), raw=False)
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1.0 / 14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / 14, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi_series = 100 - (100 / (1 + rs))
 
     recent_high_idx = int(close.idxmax())
     recent_low_idx = int(close.idxmin())

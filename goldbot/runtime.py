@@ -14,6 +14,7 @@ from goldbot.indicators import calc_atr, calc_ema
 from goldbot.budget import SharedBudgetManager
 from goldbot.config import load_settings
 from goldbot.marketdata import OandaClient, SpreadTooWideError
+from goldbot.models import Opportunity
 from goldbot.news import fetch_calendar_events, filter_gold_events
 from goldbot.real_yields import apply_real_yield_overlay, load_real_yield_signal_from_macro_state
 from goldbot.shared_backend import load_json_payload, publish_runtime_status, save_json_payload
@@ -308,7 +309,7 @@ class GoldBotRuntime:
         self._publish_runtime_status("trade_opened", state, balance=balance)
         return result
 
-    def _await_entry_quote(self, opportunity: dict) -> dict[str, float]:
+    def _await_entry_quote(self, opportunity: Opportunity) -> dict[str, float]:
         quote = self.client.get_price(self.settings.instrument)
         if opportunity.strategy != "MACRO_BREAKOUT" or self.settings.execution_mode != "live":
             self.client.validate_entry_spread(quote)
@@ -340,7 +341,7 @@ class GoldBotRuntime:
             time.sleep(1.0)
             quote = self.client.get_price(self.settings.instrument)
 
-    def _build_trade_record(self, opportunity: dict, result: dict, size: float, risk_amount: float, opened_at: datetime) -> dict:
+    def _build_trade_record(self, opportunity: Opportunity, result: dict, size: float, risk_amount: float, opened_at: datetime) -> dict:
         return {
             "id": str(result["id"]),
             "instrument": self.settings.instrument,
@@ -544,7 +545,7 @@ class GoldBotRuntime:
             if candidate_stop <= current_stop:
                 return False
         else:
-            if current_stop and candidate_stop >= current_stop:
+            if current_stop > 0 and candidate_stop >= current_stop:
                 return False
         if self.client.modify_trade(str(trade["id"]), stop_price=candidate_stop):
             trade["stop_price"] = round(candidate_stop, 3)

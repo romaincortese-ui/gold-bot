@@ -45,16 +45,18 @@ class OandaClient:
                 "margin_available": self.settings.paper_balance,
                 "currency": "GBP" if self.settings.account_type == "spread_bet" else "USD",
             }
-        if force_broker:
-            response = requests.get(
-                f"{self.api_url}/v3/accounts/{self.settings.oanda_account_id}/summary",
-                headers=self._headers(),
-                timeout=20,
-            )
-            response.raise_for_status()
-            payload = response.json()
-        else:
-            payload = self._get(f"/v3/accounts/{self.settings.oanda_account_id}/summary")
+        try:
+            payload = self._get(f"/v3/accounts/{self.settings.oanda_account_id}/summary", _force=force_broker)
+        except requests.exceptions.RequestException as exc:
+            log.warning("Failed to fetch account summary after retries: %s", exc)
+            return {
+                "balance": self.settings.paper_balance,
+                "nav": self.settings.paper_balance,
+                "unrealized_pl": 0.0,
+                "margin_used": 0.0,
+                "margin_available": self.settings.paper_balance,
+                "currency": "GBP" if self.settings.account_type == "spread_bet" else "USD",
+            }
         account = payload.get("account", {})
         return {
             "balance": float(account.get("balance", 0.0)),
@@ -135,10 +137,14 @@ class OandaClient:
                 return {"bid": 0.0, "ask": 0.0, "mid": 0.0, "spread": 0.0}
             price = float(df["close"].iloc[-1])
             return {"bid": price, "ask": price, "mid": price, "spread": 0.0}
-        payload = self._get(
-            f"/v3/accounts/{self.settings.oanda_account_id}/pricing",
-            params={"instruments": instrument},
-        )
+        try:
+            payload = self._get(
+                f"/v3/accounts/{self.settings.oanda_account_id}/pricing",
+                params={"instruments": instrument},
+            )
+        except requests.exceptions.RequestException as exc:
+            log.warning("Failed to fetch price for %s after retries: %s", instrument, exc)
+            return {"bid": 0.0, "ask": 0.0, "mid": 0.0, "spread": 0.0}
         prices = payload.get("prices", [])
         if not prices:
             return {"bid": 0.0, "ask": 0.0, "mid": 0.0, "spread": 0.0}
@@ -168,16 +174,11 @@ class OandaClient:
     def list_open_trades(self, *, force_broker: bool = False) -> list[dict]:
         if ((not force_broker) and self.settings.execution_mode in {"signal_only", "paper"}) or not self.settings.oanda_account_id:
             return []
-        if force_broker:
-            response = requests.get(
-                f"{self.api_url}/v3/accounts/{self.settings.oanda_account_id}/openTrades",
-                headers=self._headers(),
-                timeout=20,
-            )
-            response.raise_for_status()
-            payload = response.json()
-        else:
-            payload = self._get(f"/v3/accounts/{self.settings.oanda_account_id}/openTrades")
+        try:
+            payload = self._get(f"/v3/accounts/{self.settings.oanda_account_id}/openTrades", _force=force_broker)
+        except requests.exceptions.RequestException as exc:
+            log.warning("Failed to fetch open trades after retries: %s", exc)
+            return []
         return list(payload.get("trades", []))
 
     def calculate_xau_size(self, risk_amount: float, stop_distance: float, account_currency: str) -> float:
@@ -275,8 +276,8 @@ class OandaClient:
             headers["Authorization"] = f"Bearer {self.settings.oanda_api_key}"
         return headers
 
-    def _get(self, path: str, params: dict | None = None) -> dict:
-        if self.settings.execution_mode in {"signal_only", "paper"} and path.startswith("/v3/accounts"):
+    def _get(self, path: str, params: dict | None = None, *, _force: bool = False) -> dict:
+        if not _force and self.settings.execution_mode in {"signal_only", "paper"} and path.startswith("/v3/accounts"):
             return {}
         last_exc: Exception | None = None
         for attempt in range(_MAX_RETRIES):
