@@ -51,7 +51,7 @@ def test_build_recent_events_message_uses_latest_events(tmp_path) -> None:
         }
     )
 
-    assert "trade opened" in message
+    assert "Trade Opened" in message
     assert "Moved stop" in message
 
 

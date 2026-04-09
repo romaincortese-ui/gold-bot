@@ -310,15 +310,37 @@ class GoldTelegramClient:
         mapping = {
             "trade_opened": "🟢",
             "trade_closed": "⚪",
+            "trade_stopped": "🔴",
             "partial_profit": "💰",
             "break_even": "🛡️",
+            "trail_update": "📈",
             "manual_pause": "⏸️",
             "manual_resume": "▶️",
             "sync": "🔄",
             "close_all": "🛑",
             "spread_too_wide": "🟠",
+            "runtime_error": "⚠️",
         }
         return mapping.get(event_name, "ℹ️")
+
+    @staticmethod
+    def _event_title(event_type: str | None) -> str:
+        event_name = str(event_type or "").lower()
+        mapping = {
+            "trade_opened": "Trade Opened",
+            "trade_closed": "Trade Closed",
+            "trade_stopped": "Stop Hit",
+            "partial_profit": "Partial Profit",
+            "break_even": "Break-Even",
+            "trail_update": "Trail Update",
+            "manual_pause": "Paused",
+            "manual_resume": "Resumed",
+            "sync": "Broker Sync",
+            "close_all": "Close All",
+            "spread_too_wide": "Spread Blocked",
+            "runtime_error": "Error",
+        }
+        return mapping.get(event_name, event_name.replace("_", " ").title())
 
     def _build_status_message(self, state: dict) -> str:
         open_trades = list(state.get("open_trades", []))
@@ -424,7 +446,7 @@ class GoldTelegramClient:
         for event in events:
             lines.append(
                 f"{self._event_emoji(event.get('type'))} {escape(self._format_timestamp(event.get('timestamp')))} | "
-                f"{escape(str(event.get('type', '')).replace('_', ' '))}"
+                f"{escape(self._event_title(event.get('type')))}"
             )
             lines.append(escape(str(event.get("message", ""))))
         return "\n".join(lines)
@@ -486,13 +508,14 @@ class GoldTelegramClient:
     @staticmethod
     def _format_event(event: dict) -> str:
         timestamp = GoldTelegramClient._format_timestamp(event.get("timestamp"))
-        event_type = escape(str(event.get("type", "")).replace("_", " "))
+        event_type = str(event.get("type", ""))
+        emoji = GoldTelegramClient._event_emoji(event_type)
+        title = GoldTelegramClient._event_title(event_type)
         message = escape(str(event.get("message", "")))
         return (
-            "🔔 <b>Gold Event</b>\n"
+            f"{emoji} <b>Gold: {escape(title)}</b>\n"
             "━━━━━━━━━━━━━━━\n"
             f"{escape(timestamp)}\n"
-            f"{event_type}\n"
             f"{message}"
         )
 

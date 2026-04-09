@@ -80,8 +80,9 @@ class GoldBotRuntime:
             except Exception as exc:
                 log.exception("Gold-bot cycle failed: %s", exc)
                 state = self._load_state()
-                self._record_event(state, "runtime_error", f"Gold-bot cycle failed: {exc}", now=datetime.now(timezone.utc))
-                state["last_error"] = str(exc)
+                error_msg = self._sanitize_error(str(exc))
+                self._record_event(state, "runtime_error", f"Cycle error: {error_msg}", now=datetime.now(timezone.utc))
+                state["last_error"] = error_msg
                 self._save_state(state)
                 self._publish_runtime_status("error", state, balance=state.get("account_balance"))
                 next_cycle_at = time.monotonic() + self.settings.poll_interval_seconds
@@ -657,6 +658,13 @@ class GoldBotRuntime:
         if len(events) > 200:
             del events[:-200]
 
+    @staticmethod
+    def _sanitize_error(error_text: str) -> str:
+        import re
+        text = re.sub(r'for url: https?://\S+', '', error_text).strip()
+        text = re.sub(r'https?://\S+', '[OANDA API]', text)
+        return text[:300]
+
     def _publish_runtime_status(self, state_name: str, state: dict, balance: float | None) -> None:
         publish_runtime_status(
             service="gold-bot",
@@ -694,23 +702,47 @@ class GoldBotRuntime:
     def _build_heartbeat_message(self, state_name: str, state: dict, balance: float | None) -> str:
         open_trades = list(state.get("open_trades", []))
         session = state.get("last_session") or "unknown"
-        skip_reason = state.get("skip_reason") or "none"
-        last_run = state.get("last_run_at") or "never"
-        balance_text = f"{balance:.2f}" if balance is not None else "n/a"
-        return (
-            f"Gold-bot heartbeat\n"
-            f"State: {state_name}\n"
-            f"Last run: {last_run}\n"
-            f"Session: {session}\n"
-            f"Open trades: {len(open_trades)}\n"
-            f"Balance: {balance_text}\n"
-            f"Skip reason: {skip_reason}"
-        )
+        skip_reason = state.get("skip_reason")
+        currency = state.get("account_currency") or "GBP"
+        balance_text = f"{currency}{balance:,.2f}" if balance is not None else "n/a"
+        state_labels = {
+            "scanning": "\U0001f7e2 Scanning",
+            "idle": "\U0001f7e2 Idle",
+            "trade_opened": "\U0001f7e2 Trade opened",
+            "active_trade": "\U0001f7e2 Managing trade",
+            "paused": "\u23f8\ufe0f Paused",
+            "error": "\U0001f534 Error",
+            "booting": "\U0001f7e1 Booting",
+            "waiting_data": "\U0001f7e1 Waiting for data",
+            "pre_news_pause": "\U0001f7e1 Pre-news pause",
+        }
+        state_text = state_labels.get(state_name, state_name.replace("_", " ").title())
+        lines = [
+            "\U0001f493 <b>Gold Heartbeat</b>",
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+            f"State: {state_text}",
+            f"Session: {session}",
+            f"Balance: {balance_text}",
+            f"Open trades: {len(open_trades)}",
+        ]
+        if skip_reason and skip_reason != "none":
+            reason_labels = {
+                "no_signal": "no signal",
+                "open_gold_position": "existing gold position",
+                "pre_news_pause": "pre-news pause",
+                "missing_candles": "waiting for candle data",
+                "paused_manual": "paused manually",
+            }
+            lines.append(f"Skip: {reason_labels.get(skip_reason, skip_reason.replace('_', ' '))}")
+        return "\n".join(lines)
 
     def _send_telegram_message(self, message: str) -> None:
-        response = requests.post(
-            f"https://api.telegram.org/bot{self.telegram_token}/sendMessage",
-            json={"chat_id": self.telegram_chat_id, "text": message},
-            timeout=10,
-        )
-        response.raise_for_status()
+        try:
+            response = requests.post(
+                f"https://api.telegram.org/bot{self.telegram_token}/sendMessage",
+                json={"chat_id": self.telegram_chat_id, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True},
+                timeout=10,
+            )
+            response.raise_for_status()
+        except Exception as exc:
+            log.warning("Failed to send Telegram heartbeat: %s", exc)

@@ -301,14 +301,33 @@ class OandaClient:
         raise last_exc  # type: ignore[misc]
 
     def _post(self, path: str, payload: dict) -> dict:
-        response = requests.post(f"{self.api_url}{path}", headers=self._headers(), data=json.dumps(payload), timeout=20)
-        response.raise_for_status()
-        return response.json()
+        return self._mutate("POST", path, payload)
 
     def _put(self, path: str, payload: dict) -> dict:
-        response = requests.put(f"{self.api_url}{path}", headers=self._headers(), data=json.dumps(payload), timeout=20)
-        response.raise_for_status()
-        return response.json()
+        return self._mutate("PUT", path, payload)
+
+    def _mutate(self, method: str, path: str, payload: dict) -> dict:
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_RETRIES):
+            try:
+                fn = requests.post if method == "POST" else requests.put
+                response = fn(f"{self.api_url}{path}", headers=self._headers(), data=json.dumps(payload), timeout=20)
+                if response.status_code in _TRANSIENT_STATUS_CODES and attempt < _MAX_RETRIES - 1:
+                    wait = _RETRY_BACKOFF * (2 ** attempt)
+                    log.warning("OANDA %s on %s %s \u2013 retry %d/%d in %ds", response.status_code, method, path, attempt + 1, _MAX_RETRIES, wait)
+                    time.sleep(wait)
+                    continue
+                response.raise_for_status()
+                return response.json()
+            except requests.exceptions.ConnectionError as exc:
+                last_exc = exc
+                if attempt < _MAX_RETRIES - 1:
+                    wait = _RETRY_BACKOFF * (2 ** attempt)
+                    log.warning("OANDA connection error on %s %s \u2013 retry %d/%d in %ds: %s", method, path, attempt + 1, _MAX_RETRIES, wait, exc)
+                    time.sleep(wait)
+                    continue
+                raise
+        raise last_exc  # type: ignore[misc]
 
     @staticmethod
     def _format_price(price: float) -> str:

@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from goldbot.runtime import GoldBotRuntime
 
@@ -210,8 +210,8 @@ def test_publish_runtime_status_sends_heartbeat_when_interval_elapsed(monkeypatc
     runtime._publish_runtime_status("idle", state, balance=10000.0)
 
     assert sent_messages
-    assert "Gold-bot heartbeat" in sent_messages[0]
-    assert "State: idle" in sent_messages[0]
+    assert "Gold Heartbeat" in sent_messages[0]
+    assert "Idle" in sent_messages[0]
 
 
 def test_await_entry_quote_requires_macro_spread_stability(monkeypatch) -> None:
@@ -256,11 +256,12 @@ def test_run_cycle_scales_risk_when_real_yields_are_adverse(tmp_path, monkeypatc
         }
     )
     runtime.client.settings = runtime.settings
+    recent_as_of = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
     (tmp_path / "macro.json").write_text(
         json.dumps(
             {
                 "real_yields": {
-                    "as_of": "2026-04-07T12:00:00+00:00",
+                    "as_of": recent_as_of,
                     "nominal_10y": 4.2,
                     "tips_10y": 2.1,
                     "real_yield_10y": 2.1,

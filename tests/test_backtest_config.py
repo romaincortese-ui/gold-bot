@@ -13,6 +13,9 @@ def test_backtest_config_defaults_to_30_day_window(monkeypatch) -> None:
     monkeypatch.delenv("GOLD_BACKTEST_START", raising=False)
     monkeypatch.delenv("GOLD_BACKTEST_END", raising=False)
     monkeypatch.delenv("GOLD_BACKTEST_ROLLING_DAYS", raising=False)
+    monkeypatch.delenv("BACKTEST_START", raising=False)
+    monkeypatch.delenv("BACKTEST_END", raising=False)
+    monkeypatch.delenv("BACKTEST_ROLLING_DAYS", raising=False)
 
     config = GoldBacktestConfig.from_env(now=datetime(2026, 4, 6, 15, 44, tzinfo=timezone.utc))
 
