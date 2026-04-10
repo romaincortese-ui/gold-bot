@@ -1,9 +1,10 @@
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 from goldbot.config import Settings
 from goldbot.models import BudgetSnapshot
-from goldbot.shared_backend import load_json_payload, save_json_payload
+from goldbot.shared_backend import load_json_payload, merge_bot_budget_slot, save_json_payload
 
 
 class SharedBudgetManager:
@@ -38,7 +39,8 @@ class SharedBudgetManager:
         if trade_id not in trades:
             gold["reserved_risk"] = float(gold.get("reserved_risk", 0.0)) + float(risk_amount)
         trades[trade_id] = {"risk_amount": float(risk_amount), "strategy": strategy}
-        self._write(payload)
+        gold["updated_at"] = datetime.now(timezone.utc).isoformat()
+        merge_bot_budget_slot(str(self.path), self.redis_key, "gold", gold)
 
     def release_gold_risk(self, trade_id: str) -> None:
         payload = self._load()
@@ -48,10 +50,8 @@ class SharedBudgetManager:
         trade = trades.pop(trade_id, None)
         if trade is not None:
             gold["reserved_risk"] = max(0.0, float(gold.get("reserved_risk", 0.0)) - float(trade.get("risk_amount", 0.0)))
-            self._write(payload)
+            gold["updated_at"] = datetime.now(timezone.utc).isoformat()
+            merge_bot_budget_slot(str(self.path), self.redis_key, "gold", gold)
 
     def _load(self) -> dict:
         return load_json_payload(str(self.path), self.redis_key, {"bots": {}})
-
-    def _write(self, payload: dict) -> None:
-        save_json_payload(str(self.path), payload, self.redis_key)

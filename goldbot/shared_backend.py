@@ -101,6 +101,65 @@ def save_json_payload(file_path: str, payload: dict, redis_key: str | None = Non
     tmp.replace(path)  # atomic on most OS
 
 
+def merge_bot_budget_slot(file_path: str, redis_key: str | None, bot_name: str, slot_data: dict, *, _max_attempts: int = 3) -> bool:
+    """Atomically update only the given bot's slot in the shared budget payload.
+
+    Uses Redis WATCH/MULTI for optimistic locking when Redis is available,
+    so concurrent writes from the sibling bot don't clobber each other.
+    Falls back to a simple read-modify-write on file when Redis is unavailable.
+    """
+    client = get_redis_client()
+
+    # ── Redis path: optimistic lock via WATCH ──
+    if client is not None and redis_key and redis is not None:
+        for attempt in range(_max_attempts):
+            try:
+                pipe = client.pipeline(True)  # MULTI/EXEC pipeline
+                pipe.watch(redis_key)
+                raw = pipe.get(redis_key)
+                payload = json.loads(raw) if raw else {"bots": {}}
+                if not isinstance(payload, dict):
+                    payload = {"bots": {}}
+                bots = payload.setdefault("bots", {})
+                bots[bot_name] = slot_data
+                pipe.multi()
+                pipe.set(redis_key, json.dumps(payload))
+                pipe.execute()
+                # Also persist to file for local reads
+                _write_file_atomic(file_path, payload)
+                return True
+            except redis.WatchError:
+                log.debug("Budget WATCH conflict (attempt %d/%d)", attempt + 1, _max_attempts)
+                continue
+            except Exception as exc:
+                log.warning("Redis merge_bot_budget_slot failed: %s", exc)
+                _invalidate_redis_client()
+                break  # fall through to file path
+
+    # ── File-only path ──
+    path = Path(file_path)
+    payload: dict = {"bots": {}}
+    if path.exists():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                payload = {"bots": {}}
+        except (json.JSONDecodeError, OSError):
+            payload = {"bots": {}}
+    bots = payload.setdefault("bots", {})
+    bots[bot_name] = slot_data
+    _write_file_atomic(file_path, payload)
+    return True
+
+
+def _write_file_atomic(file_path: str, payload: dict) -> None:
+    path = Path(file_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
 def publish_runtime_status(service: str, state: str, *, redis_key: str | None, ttl_seconds: int, file_path: str | None = None, **fields) -> bool:
     client = get_redis_client()
     payload = {
