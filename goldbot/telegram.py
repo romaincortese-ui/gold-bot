@@ -155,7 +155,7 @@ class GoldTelegramClient:
             self._append_event(state, "sync_requested", "Telegram operator requested broker sync")
             self._save_state(state)
             return "Sync request queued. Gold-bot will reconcile tracked trades with the broker on the next cycle."
-        if command == "/closeall":
+        if command == "/closeall" or command == "/close":
             self._append_control_request(state, "close_all")
             self._append_event(state, "close_all_requested", "Telegram operator requested close-all")
             self._save_state(state)
@@ -174,7 +174,7 @@ class GoldTelegramClient:
             "/pause - Queue a pause request\n"
             "/resume - Queue a resume request\n"
             "/sync - Queue a broker sync\n"
-            "/closeall - Queue close-all"
+            "/close / /closeall - Queue close-all"
         )
 
     def _runtime_snapshot(self, state: dict) -> dict:
