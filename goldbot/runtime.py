@@ -750,7 +750,8 @@ class GoldBotRuntime:
         session = state.get("last_session") or "unknown"
         skip_reason = state.get("skip_reason")
         currency = state.get("account_currency") or "GBP"
-        balance_text = f"{currency}{balance:,.2f}" if balance is not None else "n/a"
+        gold_balance = balance * self.settings.gold_budget_allocation if balance is not None else None
+        balance_text = f"{currency}{gold_balance:,.2f}" if gold_balance is not None else "n/a"
         execution_mode = state.get("execution_mode", self.settings.execution_mode)
         mode_labels = {
             "live": "\U0001f4b0 LIVE",
