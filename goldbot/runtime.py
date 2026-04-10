@@ -12,6 +12,15 @@ import requests
 from goldbot.indicators import calc_atr, calc_ema
 
 from goldbot.budget import SharedBudgetManager
+from goldbot.calibration import (
+    CALIBRATION_FILE,
+    CALIBRATION_MAX_AGE_HOURS,
+    CALIBRATION_MIN_TRADES,
+    CALIBRATION_REDIS_KEY,
+    get_strategy_adjustment,
+    load_calibration,
+    validate_calibration,
+)
 from goldbot.config import load_settings
 from goldbot.marketdata import OandaClient, SpreadTooWideError
 from goldbot.models import Opportunity
@@ -54,6 +63,9 @@ class GoldBotRuntime:
         self.telegram_offset_path = Path(os.getenv("GOLD_TELEGRAM_OFFSET_FILE", "telegram_state.json"))
         self.heartbeat_interval = int(os.getenv("GOLD_HEARTBEAT_INTERVAL", "3600"))
         self.last_heartbeat_at = 0.0
+        self.calibration_file = os.getenv("GOLD_CALIBRATION_FILE", CALIBRATION_FILE).strip()
+        self.calibration_redis_key = os.getenv("GOLD_CALIBRATION_REDIS_KEY", CALIBRATION_REDIS_KEY).strip()
+        self.calibration: dict | None = None
         self.telegram_client = self._build_telegram_client()
 
     def run_forever(self) -> None:
@@ -99,6 +111,29 @@ class GoldBotRuntime:
             state_path=self.state_path,
             offset_path=self.telegram_offset_path,
         )
+
+    def _refresh_calibration(self) -> None:
+        try:
+            data = load_calibration(file_path=self.calibration_file, redis_key=self.calibration_redis_key)
+            if data is None:
+                log.debug("No calibration data available")
+                self.calibration = None
+                return
+            valid, reason = validate_calibration(data)
+            if not valid:
+                log.info("Calibration invalid: %s", reason)
+                self.calibration = None
+                return
+            self.calibration = data
+            log.info(
+                "Loaded calibration: %d trades, pf=%.2f, wr=%.0f%%",
+                data.get("total_trades", 0),
+                data.get("profit_factor", 0),
+                data.get("win_rate", 0) * 100,
+            )
+        except Exception:
+            log.exception("Failed to load calibration")
+            self.calibration = None
 
     def _announce_telegram_startup(self) -> None:
         if self.telegram_client is None:
@@ -210,20 +245,29 @@ class GoldBotRuntime:
             max_age_hours=self.settings.real_yield_state_max_age_hours,
         )
 
+        self._refresh_calibration()
+
         opportunities = [
             score_macro_breakout(self.settings, now, session_name, df_m15, df_h1, relevant_events, breakout_volume_signal),
             score_exhaustion_reversal(self.settings, df_h4, df_d1),
             score_trend_pullback(self.settings, df_h1, df_h4, usd_proxy_frames),
         ]
-        best = select_best_opportunity(
-            [
-                filtered
-                for opportunity in opportunities
-                if opportunity is not None and not self._is_cooldown_active(state, opportunity, now)
-                for filtered in [apply_real_yield_overlay(self.settings, opportunity, real_yield_signal)]
-                if filtered is not None
-            ]
-        )
+
+        calibrated: list[Opportunity] = []
+        for opportunity in opportunities:
+            if opportunity is None or self._is_cooldown_active(state, opportunity, now):
+                continue
+            adj = get_strategy_adjustment(self.calibration, opportunity.strategy)
+            if adj.get("block_reason"):
+                log.info("Calibration blocked %s: %s", opportunity.strategy, adj["block_reason"])
+                continue
+            opportunity.score += float(adj.get("score_offset", 0.0))
+            opportunity.metadata["calibration_risk_mult"] = float(adj.get("risk_mult", 1.0))
+            filtered = apply_real_yield_overlay(self.settings, opportunity, real_yield_signal)
+            if filtered is not None:
+                calibrated.append(filtered)
+
+        best = select_best_opportunity(calibrated)
         if best is None:
             log.info("No XAU/USD opportunity passed filters")
             state.update({"last_run_at": now.isoformat(), "last_session": session_name, "skip_reason": "no_signal"})
@@ -231,7 +275,8 @@ class GoldBotRuntime:
             self._publish_runtime_status("scanning", state, balance=balance)
             return None
 
-        risk_multiplier = float(best.metadata.get("risk_multiplier", 1.0) or 1.0)
+        calibration_risk_mult = float(best.metadata.get("calibration_risk_mult", 1.0) or 1.0)
+        risk_multiplier = float(best.metadata.get("risk_multiplier", 1.0) or 1.0) * calibration_risk_mult
         risk_amount = min(snapshot.max_trade_risk_amount * risk_multiplier, snapshot.available_gold_risk)
         if risk_amount <= 0:
             log.info("No gold risk budget available")
