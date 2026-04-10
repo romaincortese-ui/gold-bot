@@ -208,7 +208,15 @@ class GoldBacktestEngine:
         closed_trades: list[dict[str, Any]],
     ) -> dict[str, Any] | None:
         if self._stop_hit(trade, bar):
-            closed = self._close_trade(trade, exit_price=float(trade["stop_price"]), exit_time=bar["time"], reason="STOP_LOSS")
+            stop_price = float(trade["stop_price"])
+            entry_price = float(trade["entry_price"])
+            if trade["direction"] == "LONG" and stop_price > entry_price:
+                reason = "TRAILING_STOP"
+            elif trade["direction"] == "SHORT" and stop_price < entry_price:
+                reason = "TRAILING_STOP"
+            else:
+                reason = "STOP_LOSS"
+            closed = self._close_trade(trade, exit_price=stop_price, exit_time=bar["time"], reason=reason)
             closed_trades.append(closed)
             return closed
 
