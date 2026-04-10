@@ -16,6 +16,12 @@ _TRANSIENT_STATUS_CODES = {502, 503, 504, 429}
 _MAX_RETRIES = 3
 _RETRY_BACKOFF = 2  # seconds, doubles each attempt
 
+_URL_PATTERN = __import__("re").compile(r'for url: https?://\S+|https?://\S+')
+
+
+def _strip_url(text: str) -> str:
+    return _URL_PATTERN.sub("[OANDA API]", text).strip()
+
 
 class SpreadTooWideError(RuntimeError):
     pass
@@ -290,6 +296,10 @@ class OandaClient:
                     continue
                 response.raise_for_status()
                 return response.json()
+            except requests.exceptions.HTTPError as exc:
+                raise requests.exceptions.HTTPError(
+                    _strip_url(str(exc)), response=exc.response,
+                ) from None
             except requests.exceptions.ConnectionError as exc:
                 last_exc = exc
                 if attempt < _MAX_RETRIES - 1:
@@ -297,7 +307,7 @@ class OandaClient:
                     log.warning("OANDA connection error on %s – retry %d/%d in %ds: %s", path, attempt + 1, _MAX_RETRIES, wait, exc)
                     time.sleep(wait)
                     continue
-                raise
+                raise requests.exceptions.ConnectionError(_strip_url(str(exc))) from None
         raise last_exc  # type: ignore[misc]
 
     def _post(self, path: str, payload: dict) -> dict:
@@ -319,6 +329,10 @@ class OandaClient:
                     continue
                 response.raise_for_status()
                 return response.json()
+            except requests.exceptions.HTTPError as exc:
+                raise requests.exceptions.HTTPError(
+                    _strip_url(str(exc)), response=exc.response,
+                ) from None
             except requests.exceptions.ConnectionError as exc:
                 last_exc = exc
                 if attempt < _MAX_RETRIES - 1:
@@ -326,7 +340,7 @@ class OandaClient:
                     log.warning("OANDA connection error on %s %s \u2013 retry %d/%d in %ds: %s", method, path, attempt + 1, _MAX_RETRIES, wait, exc)
                     time.sleep(wait)
                     continue
-                raise
+                raise requests.exceptions.ConnectionError(_strip_url(str(exc))) from None
         raise last_exc  # type: ignore[misc]
 
     @staticmethod

@@ -120,6 +120,7 @@ class GoldBotRuntime:
         now = datetime.now(timezone.utc)
         session_name = self._session_name(now)
         state = self._load_state()
+        state.pop("last_error", None)
 
         self._process_control_requests(state)
         self._prune_cooldowns(state, now)
