@@ -19,29 +19,34 @@ def _invalidate_redis_client() -> None:
     _redis_url = None
 
 
-def get_redis_client():
+def get_redis_client(*, _retries: int = 3, _delay: float = 2.0):
     global _redis_client, _redis_url
     redis_url = os.getenv("REDIS_URL", "").strip()
     if not redis_url or redis is None:
         return None
     if _redis_client is not None and _redis_url == redis_url:
         return _redis_client
-    try:
-        _redis_client = redis.from_url(
-            redis_url,
-            socket_connect_timeout=5,
-            socket_timeout=5,
-            health_check_interval=30,
-            retry_on_timeout=True,
-        )
-        _redis_client.ping()
-        _redis_url = redis_url
-        return _redis_client
-    except Exception as exc:
-        import logging as _logging
-        _logging.getLogger(__name__).warning("Redis connection failed: %s", exc)
-        _invalidate_redis_client()
-        return None
+    import logging as _logging
+    import time as _time
+    log = _logging.getLogger(__name__)
+    for attempt in range(1, _retries + 1):
+        try:
+            _redis_client = redis.from_url(
+                redis_url,
+                socket_connect_timeout=5,
+                socket_timeout=5,
+                health_check_interval=30,
+                retry_on_timeout=True,
+            )
+            _redis_client.ping()
+            _redis_url = redis_url
+            return _redis_client
+        except Exception as exc:
+            log.warning("Redis connection attempt %d/%d failed: %s", attempt, _retries, exc)
+            _invalidate_redis_client()
+            if attempt < _retries:
+                _time.sleep(_delay * attempt)
+    return None
 
 
 def load_json_payload(file_path: str, redis_key: str | None = None, default: dict | None = None) -> dict:
