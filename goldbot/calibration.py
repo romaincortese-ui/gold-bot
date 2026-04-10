@@ -95,10 +95,9 @@ def save_calibration(calibration: Mapping[str, Any], *, file_path: str = CALIBRA
     """Persist calibration to Redis and/or JSON file."""
     import os as _os
     client = get_redis_client()
-    payload = json.dumps(calibration, indent=2)
     if client is not None:
         try:
-            client.set(redis_key, payload)
+            client.set(redis_key, json.dumps(calibration))
             log.info("Published calibration to Redis key %s", redis_key)
         except Exception:
             log.warning("Failed to publish calibration to Redis", exc_info=True)
@@ -110,7 +109,7 @@ def save_calibration(calibration: Mapping[str, Any], *, file_path: str = CALIBRA
             log.warning("Redis client unavailable (connection failed?) – skipping Redis publish")
     path = Path(file_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(payload, encoding="utf-8")
+    path.write_text(json.dumps(calibration, indent=2), encoding="utf-8")
     log.info("Wrote calibration to %s", path)
 
 
