@@ -93,6 +93,7 @@ def build_calibration(report: Mapping[str, Any], *, window_start: datetime, wind
 
 def save_calibration(calibration: Mapping[str, Any], *, file_path: str = CALIBRATION_FILE, redis_key: str = CALIBRATION_REDIS_KEY) -> None:
     """Persist calibration to Redis and/or JSON file."""
+    import os as _os
     client = get_redis_client()
     payload = json.dumps(calibration, indent=2)
     if client is not None:
@@ -100,7 +101,13 @@ def save_calibration(calibration: Mapping[str, Any], *, file_path: str = CALIBRA
             client.set(redis_key, payload)
             log.info("Published calibration to Redis key %s", redis_key)
         except Exception:
-            log.warning("Failed to publish calibration to Redis")
+            log.warning("Failed to publish calibration to Redis", exc_info=True)
+    else:
+        redis_url = _os.getenv("REDIS_URL", "")
+        if not redis_url:
+            log.warning("REDIS_URL not set – skipping Redis publish")
+        else:
+            log.warning("Redis client unavailable (connection failed?) – skipping Redis publish")
     path = Path(file_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(payload, encoding="utf-8")
@@ -114,9 +121,14 @@ def load_calibration(*, file_path: str = CALIBRATION_FILE, redis_key: str = CALI
         try:
             raw = client.get(redis_key)
             if raw:
+                log.info("Loaded calibration from Redis key %s", redis_key)
                 return json.loads(raw)
+            else:
+                log.info("Redis key %s is empty, falling back to file", redis_key)
         except Exception:
-            pass
+            log.warning("Failed to read calibration from Redis", exc_info=True)
+    else:
+        log.debug("Redis unavailable for calibration load, using file fallback")
     path = Path(file_path)
     if path.exists():
         try:

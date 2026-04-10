@@ -37,7 +37,9 @@ def get_redis_client():
         _redis_client.ping()
         _redis_url = redis_url
         return _redis_client
-    except Exception:
+    except Exception as exc:
+        import logging as _logging
+        _logging.getLogger(__name__).warning("Redis connection failed: %s", exc)
         _invalidate_redis_client()
         return None
 
