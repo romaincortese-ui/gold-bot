@@ -47,10 +47,10 @@ def get_redis_client(*, _retries: int = 3, _delay: float = 2.0):
                 )
                 _redis_client.ping()
                 _redis_url = redis_url
-                log.info("Redis connected via %s", redis_url.split("@")[-1] if "@" in redis_url else "(url)")
+                log.info("Redis connected via %s", redis_url.split("@")[-1] if "@" in redis_url else redis_url.split("//")[-1])
                 return _redis_client
             except Exception as exc:
-                log.warning("Redis connection attempt %d/%d failed (%s): %s", attempt, _retries, redis_url.split("@")[-1] if "@" in redis_url else "(url)", exc)
+                log.warning("Redis connection attempt %d/%d failed (%s): %s", attempt, _retries, redis_url.split("@")[-1] if "@" in redis_url else redis_url.split("//")[-1], exc)
                 _invalidate_redis_client()
                 if attempt < _retries:
                     _time.sleep(_delay * attempt)
