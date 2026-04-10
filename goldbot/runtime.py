@@ -705,6 +705,21 @@ class GoldBotRuntime:
         skip_reason = state.get("skip_reason")
         currency = state.get("account_currency") or "GBP"
         balance_text = f"{currency}{balance:,.2f}" if balance is not None else "n/a"
+        execution_mode = state.get("execution_mode", self.settings.execution_mode)
+        mode_labels = {
+            "live": "\U0001f4b0 LIVE",
+            "paper": "\U0001f4dd PAPER",
+            "signal_only": "\U0001f4e1 SIGNAL",
+        }
+        mode_text = mode_labels.get(execution_mode, execution_mode.upper())
+        session_labels = {
+            "OFF_HOURS": "\U0001f319 OFF_HOURS",
+            "ASIA": "\U0001f30f ASIA",
+            "LONDON": "\U0001f1ec\U0001f1e7 LONDON",
+            "OVERLAP": "\U0001f525 OVERLAP",
+            "NEW_YORK": "\U0001f5fd NEW_YORK",
+        }
+        session_text = session_labels.get(session.upper(), session.upper())
         state_labels = {
             "scanning": "\U0001f7e2 Scanning",
             "idle": "\U0001f7e2 Idle",
@@ -717,13 +732,13 @@ class GoldBotRuntime:
             "pre_news_pause": "\U0001f7e1 Pre-news pause",
         }
         state_text = state_labels.get(state_name, state_name.replace("_", " ").title())
+        last_run_text = self._format_heartbeat_time(state.get("last_run_at"))
         lines = [
-            "\U0001f493 <b>Gold Heartbeat</b>",
+            f"\U0001f493 <b>Gold Heartbeat</b> [{mode_text}]",
             "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
-            f"State: {state_text}",
-            f"Session: {session}",
-            f"Balance: {balance_text}",
-            f"Open trades: {len(open_trades)}",
+            f"{session_text} | {state_text}",
+            f"\U0001f4b0 {balance_text} | Open: {len(open_trades)}",
+            f"\U0001f552 Last run: {last_run_text}",
         ]
         if skip_reason and skip_reason != "none":
             reason_labels = {
@@ -733,8 +748,32 @@ class GoldBotRuntime:
                 "missing_candles": "waiting for candle data",
                 "paused_manual": "paused manually",
             }
-            lines.append(f"Skip: {reason_labels.get(skip_reason, skip_reason.replace('_', ' '))}")
+            lines.append(f"\u23ed\ufe0f Skip: {reason_labels.get(skip_reason, skip_reason.replace('_', ' '))}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _format_heartbeat_time(value: str | None) -> str:
+        if not value:
+            return "never"
+        text = str(value).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return "unknown"
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.astimezone(timezone.utc)
+        now = datetime.now(timezone.utc)
+        day_delta = (parsed.date() - now.date()).days
+        if day_delta == 0:
+            prefix = "Today"
+        elif day_delta == -1:
+            prefix = "Yesterday"
+        else:
+            prefix = parsed.strftime("%a %d %b %Y")
+        return f"{prefix} at {parsed.strftime('%H:%M')} UTC"
 
     def _send_telegram_message(self, message: str) -> None:
         try:

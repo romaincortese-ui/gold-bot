@@ -11,7 +11,7 @@ import requests
 from goldbot.budget import SharedBudgetManager
 from goldbot.config import load_settings
 from goldbot.marketdata import OandaClient
-from goldbot.shared_backend import load_json_payload, load_runtime_status, publish_runtime_status, save_json_payload
+from goldbot.shared_backend import get_redis_client, load_json_payload, load_runtime_status, publish_runtime_status, save_json_payload
 
 
 logging.basicConfig(
@@ -102,6 +102,7 @@ class GoldTelegramClient:
         for update in payload.get("result", []):
             update_id = int(update.get("update_id", 0) or 0)
             offset["last_update_id"] = update_id
+            self._save_offset(offset)
             message = update.get("message", {})
             chat_id = str(message.get("chat", {}).get("id", ""))
             text = str(message.get("text", "")).strip()
@@ -110,7 +111,6 @@ class GoldTelegramClient:
             reply = self._handle_command(text)
             if reply:
                 self.send_message(reply)
-        self._save_offset(offset)
 
     def send_message(self, message: str) -> None:
         response = requests.post(
@@ -492,19 +492,6 @@ class GoldTelegramClient:
             f"Tracked open risk: {escape(self._format_currency(open_risk, currency))}"
         )
 
-    def _build_heartbeat_message(self) -> str:
-        state = self._load_state()
-        runtime = self._runtime_snapshot(state)
-        open_count = runtime["open_trade_count"]
-        return (
-            "💓 <b>Gold Telegram Heartbeat</b>\n"
-            "━━━━━━━━━━━━━━━\n"
-            f"Last runtime update: {escape(self._format_timestamp(runtime['last_run_at']))}\n"
-            f"Worker: {self._format_worker_state(runtime['worker_state'], bool(runtime['last_run_at']))}\n"
-            f"Open trades: {open_count}\n"
-            f"Bot: {self._format_bool(bool(runtime['paused']))}"
-        )
-
     @staticmethod
     def _format_event(event: dict) -> str:
         timestamp = GoldTelegramClient._format_timestamp(event.get("timestamp"))
@@ -536,15 +523,32 @@ class GoldTelegramClient:
         state.setdefault("paused", False)
         save_json_payload(str(self.state_path), state, self.state_key)
 
+    _OFFSET_REDIS_KEY = "gold_telegram_offset"
+
     def _load_offset(self) -> dict:
+        default = {"last_update_id": 0, "sent_event_ids": []}
+        client = get_redis_client()
+        if client is not None:
+            try:
+                raw = client.get(self._OFFSET_REDIS_KEY)
+                if raw:
+                    return json.loads(raw)
+            except Exception:
+                pass
         if not self.offset_path.exists():
-            return {"last_update_id": 0, "sent_event_ids": []}
+            return default
         try:
             return json.loads(self.offset_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
-            return {"last_update_id": 0, "sent_event_ids": []}
+            return default
 
     def _save_offset(self, payload: dict) -> None:
+        client = get_redis_client()
+        if client is not None:
+            try:
+                client.set(self._OFFSET_REDIS_KEY, json.dumps(payload))
+            except Exception:
+                pass
         self.offset_path.parent.mkdir(parents=True, exist_ok=True)
         self.offset_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 

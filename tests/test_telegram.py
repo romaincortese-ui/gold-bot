@@ -149,7 +149,7 @@ def test_risk_command_uses_budget_snapshot(tmp_path) -> None:
     assert "Tracked open risk: GBP25.00" in message
 
 
-def test_heartbeat_prefers_runtime_status_when_state_is_stale(tmp_path) -> None:
+def test_status_prefers_runtime_status_when_state_is_stale(tmp_path) -> None:
     client = GoldTelegramClient(
         token="token",
         chat_id="123",
@@ -161,17 +161,17 @@ def test_heartbeat_prefers_runtime_status_when_state_is_stale(tmp_path) -> None:
         "state": "idle",
         "generated_at": "2026-04-06T21:55:00+00:00",
         "last_run_at": "2026-04-06T21:54:28+00:00",
+        "last_session": "LONDON",
         "open_trades": 2,
         "paused": False,
     }
     client._save_state({"events": [], "signals": [], "open_trades": [], "paused": False})
 
-    message = client._build_heartbeat_message()
+    message = client._build_status_message(client._load_state())
 
     telegram_module.load_runtime_status = original_load_runtime_status
 
-    assert "Last runtime update: " in message
-    assert "never" not in message
+    assert "Gold Status" in message
     assert "Worker: 🟢 Idle" in message
     assert "Open trades: 2" in message
 
