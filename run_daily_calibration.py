@@ -51,7 +51,18 @@ def _force_rolling_window() -> Iterator[None]:
                 os.environ[key] = value
 
 
+def _warmup_redis() -> None:
+    """Trigger an early Redis connection to allow the Wireguard tunnel to establish
+    while the backtest runs.  Failures here are expected and harmless."""
+    from goldbot.shared_backend import get_redis_client
+    get_redis_client(_retries=1, _delay=0)
+
+
 def main() -> None:
+    # Kick off Redis connection early so the private-network tunnel can establish
+    # in the background while the backtest runs (~30-60 s).
+    _warmup_redis()
+
     with _force_rolling_window():
         config = GoldBacktestConfig.from_env()
 

@@ -21,31 +21,39 @@ def _invalidate_redis_client() -> None:
 
 def get_redis_client(*, _retries: int = 3, _delay: float = 2.0):
     global _redis_client, _redis_url
-    redis_url = os.getenv("REDIS_URL", "").strip()
-    if not redis_url or redis is None:
+    # Try REDIS_URL first, fall back to REDIS_PUBLIC_URL (TCP proxy, no Wireguard)
+    urls_to_try = []
+    for var in ("REDIS_URL", "REDIS_PUBLIC_URL"):
+        url = os.getenv(var, "").strip()
+        if url and url not in urls_to_try:
+            urls_to_try.append(url)
+    if not urls_to_try or redis is None:
         return None
-    if _redis_client is not None and _redis_url == redis_url:
+    # Return cached client if still valid
+    if _redis_client is not None and _redis_url in urls_to_try:
         return _redis_client
     import logging as _logging
     import time as _time
     log = _logging.getLogger(__name__)
-    for attempt in range(1, _retries + 1):
-        try:
-            _redis_client = redis.from_url(
-                redis_url,
-                socket_connect_timeout=5,
-                socket_timeout=5,
-                health_check_interval=30,
-                retry_on_timeout=True,
-            )
-            _redis_client.ping()
-            _redis_url = redis_url
-            return _redis_client
-        except Exception as exc:
-            log.warning("Redis connection attempt %d/%d failed: %s", attempt, _retries, exc)
-            _invalidate_redis_client()
-            if attempt < _retries:
-                _time.sleep(_delay * attempt)
+    for redis_url in urls_to_try:
+        for attempt in range(1, _retries + 1):
+            try:
+                _redis_client = redis.from_url(
+                    redis_url,
+                    socket_connect_timeout=5,
+                    socket_timeout=5,
+                    health_check_interval=30,
+                    retry_on_timeout=True,
+                )
+                _redis_client.ping()
+                _redis_url = redis_url
+                log.info("Redis connected via %s", redis_url.split("@")[-1] if "@" in redis_url else "(url)")
+                return _redis_client
+            except Exception as exc:
+                log.warning("Redis connection attempt %d/%d failed (%s): %s", attempt, _retries, redis_url.split("@")[-1] if "@" in redis_url else "(url)", exc)
+                _invalidate_redis_client()
+                if attempt < _retries:
+                    _time.sleep(_delay * attempt)
     return None
 
 
