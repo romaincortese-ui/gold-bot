@@ -711,6 +711,27 @@ class GoldBotRuntime:
         text = re.sub(r'https?://\S+', '[OANDA API]', text)
         return text[:300]
 
+    def _calibration_summary(self) -> dict:
+        """Build a compact calibration summary for status payloads."""
+        if not self.calibration:
+            return {"active": False}
+        adj = self.calibration.get("strategy_adjustments", {})
+        return {
+            "active": True,
+            "generated_at": self.calibration.get("generated_at"),
+            "total_trades": self.calibration.get("total_trades", 0),
+            "win_rate": self.calibration.get("win_rate", 0),
+            "profit_factor": self.calibration.get("profit_factor", 0),
+            "strategies": {
+                s: {
+                    "score_offset": v.get("score_offset", 0),
+                    "risk_mult": v.get("risk_mult", 1),
+                    "blocked": bool(v.get("block_reason")),
+                }
+                for s, v in adj.items()
+            },
+        }
+
     def _publish_runtime_status(self, state_name: str, state: dict, balance: float | None) -> None:
         publish_runtime_status(
             service="gold-bot",
@@ -731,6 +752,7 @@ class GoldBotRuntime:
             last_session=state.get("last_session"),
             skip_reason=state.get("skip_reason"),
             error=state.get("last_error"),
+            calibration=self._calibration_summary(),
         )
         self._maybe_send_heartbeat(state_name, state, balance)
 
@@ -780,12 +802,28 @@ class GoldBotRuntime:
         }
         state_text = state_labels.get(state_name, state_name.replace("_", " ").title())
         last_run_text = self._format_heartbeat_time(state.get("last_run_at"))
+        # Calibration summary line
+        cal = self._calibration_summary()
+        if cal.get("active"):
+            blocked = [s for s, v in cal.get("strategies", {}).items() if v.get("blocked")]
+            cal_parts = [
+                f"pf={cal.get('profit_factor', 0):.1f}",
+                f"wr={cal.get('win_rate', 0) * 100:.0f}%",
+                f"{cal.get('total_trades', 0)} trades",
+            ]
+            if blocked:
+                cal_parts.append(f"blocked: {', '.join(blocked)}")
+            cal_text = " | ".join(cal_parts)
+        else:
+            cal_text = "none loaded"
+
         lines = [
             f"\U0001f493 <b>Gold Heartbeat</b> [{mode_text}]",
             "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
             f"{session_text} | {state_text}",
             f"\U0001f4b0 {balance_text} | Open: {len(open_trades)}",
             f"\U0001f552 Last run: {last_run_text}",
+            f"\U0001f4ca Calibration: {cal_text}",
         ]
         if skip_reason and skip_reason != "none":
             reason_labels = {
