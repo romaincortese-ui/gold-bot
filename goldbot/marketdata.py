@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -54,6 +55,9 @@ class OandaClient:
         try:
             payload = self._get(f"/v3/accounts/{self.settings.oanda_account_id}/summary", _force=force_broker)
         except requests.exceptions.RequestException as exc:
+            if self.settings.execution_mode == "live":
+                log.error("CRITICAL: Cannot fetch broker balance in live mode: %s", exc)
+                raise
             log.warning("Failed to fetch account summary after retries: %s", exc)
             return {
                 "balance": self.settings.paper_balance,
@@ -192,7 +196,7 @@ class OandaClient:
             return 0.0
         if not self.uses_native_units():
             stake = risk_amount / stop_distance
-            return max(0.1, round(stake, 2))
+            return max(0.1, math.floor(stake * 100) / 100)  # round DOWN to never exceed intended risk
         conversion = self._estimate_conversion_rate("USD", account_currency)
         per_unit_risk = stop_distance * conversion
         if per_unit_risk <= 0:

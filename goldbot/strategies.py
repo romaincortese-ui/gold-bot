@@ -1,3 +1,4 @@
+import math
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -320,7 +321,10 @@ def compute_usd_regime_bias(settings: Settings, usd_proxy_h4: dict[str, pd.DataF
 
     if total_weight <= 0:
         return None
-    return weighted_bias / total_weight
+    result = weighted_bias / total_weight
+    if not math.isfinite(result):
+        return 0.0
+    return result
 
 
 def _build_exit_plan(

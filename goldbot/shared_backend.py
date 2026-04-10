@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -7,6 +8,9 @@ try:
     import redis
 except ImportError:
     redis = None  # type: ignore
+
+
+log = logging.getLogger(__name__)
 
 
 _redis_client = None
@@ -73,6 +77,13 @@ def load_json_payload(file_path: str, redis_key: str | None = None, default: dic
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
+        log.critical("State file corrupted: %s — returning default to avoid data loss", path)
+        backup = path.with_suffix(path.suffix + ".corrupt")
+        try:
+            path.rename(backup)
+            log.critical("Corrupted file preserved as %s", backup)
+        except OSError:
+            pass
         return payload_default
 
 
@@ -85,7 +96,9 @@ def save_json_payload(file_path: str, payload: dict, redis_key: str | None = Non
             _invalidate_redis_client()
     path = Path(file_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(path)  # atomic on most OS
 
 
 def publish_runtime_status(service: str, state: str, *, redis_key: str | None, ttl_seconds: int, file_path: str | None = None, **fields) -> bool:

@@ -276,6 +276,7 @@ class GoldBotRuntime:
             return None
 
         calibration_risk_mult = float(best.metadata.get("calibration_risk_mult", 1.0) or 1.0)
+        calibration_risk_mult = max(0.5, min(1.5, calibration_risk_mult))  # clamp to safe range
         risk_multiplier = float(best.metadata.get("risk_multiplier", 1.0) or 1.0) * calibration_risk_mult
         risk_amount = min(snapshot.max_trade_risk_amount * risk_multiplier, snapshot.available_gold_risk)
         if risk_amount <= 0:
@@ -549,13 +550,16 @@ class GoldBotRuntime:
             return True
 
         if (not trade.get("partial_taken")) and self._reached_level(trade["direction"], current_price, float(exit_plan["partial_take_profit_price"])):
-            partial_size = max(0.1, float(trade.get("remaining_size", trade["size"])) * float(exit_plan.get("partial_take_profit_fraction", 0.5)))
+            remaining = float(trade.get("remaining_size", trade["size"]))
+            partial_size = round(remaining * float(exit_plan.get("partial_take_profit_fraction", 0.5)), 2)
+            if partial_size < 0.01:
+                partial_size = remaining  # close all if remainder too small
             if self.client.close_trade(str(trade["id"]), size=partial_size):
                 trade["partial_taken"] = True
                 trade["remaining_size"] = max(0.0, float(trade.get("remaining_size", trade["size"])) - partial_size)
                 self._record_event(state, "partial_profit", f"Trade {trade['id']} took partial profit, remaining size {trade['remaining_size']}", now=datetime.now(timezone.utc))
 
-        if (not trade.get("break_even_moved")) and self._reached_level(trade["direction"], current_price, float(exit_plan["break_even_trigger_price"])):
+        if (not trade.get("break_even_moved")) and exit_plan.get("break_even_trigger_price") is not None and self._reached_level(trade["direction"], current_price, float(exit_plan["break_even_trigger_price"])):
             if self._tighten_stop(trade, float(trade["entry_price"])):
                 trade["break_even_moved"] = True
                 self._record_event(state, "break_even", f"Trade {trade['id']} stop moved to break-even at {trade['stop_price']}", now=datetime.now(timezone.utc))
@@ -573,18 +577,22 @@ class GoldBotRuntime:
         return True
 
     def _compute_trailing_stop(self, trade: dict) -> float | None:
-        exit_plan = trade.get("exit_plan", {})
-        timeframe = str(exit_plan.get("trail_timeframe", "H1"))
-        candles = self.client.fetch_candles(self.settings.instrument, timeframe, 120)
-        if candles is None or len(candles) < int(exit_plan.get("trail_ema_period", self.settings.trailing_ema_period)):
+        try:
+            exit_plan = trade.get("exit_plan", {})
+            timeframe = str(exit_plan.get("trail_timeframe", "H1"))
+            candles = self.client.fetch_candles(self.settings.instrument, timeframe, 120)
+            if candles is None or len(candles) < int(exit_plan.get("trail_ema_period", self.settings.trailing_ema_period)):
+                return None
+            ema = calc_ema(candles["close"], int(exit_plan.get("trail_ema_period", self.settings.trailing_ema_period)))
+            atr = calc_atr(candles, self.settings.atr_period)
+            distance = max(float(exit_plan.get("trailing_stop_distance", 0.0)), atr * float(exit_plan.get("trail_atr_mult", self.settings.trailing_atr_mult)))
+            ema_value = float(ema.iloc[-1])
+            if trade["direction"] == "LONG":
+                return ema_value - distance
+            return ema_value + distance
+        except Exception:
+            log.exception("Trailing stop computation failed for trade %s", trade.get("id"))
             return None
-        ema = calc_ema(candles["close"], int(exit_plan.get("trail_ema_period", self.settings.trailing_ema_period)))
-        atr = calc_atr(candles, self.settings.atr_period)
-        distance = max(float(exit_plan.get("trailing_stop_distance", 0.0)), atr * float(exit_plan.get("trail_atr_mult", self.settings.trailing_atr_mult)))
-        ema_value = float(ema.iloc[-1])
-        if trade["direction"] == "LONG":
-            return ema_value - distance
-        return ema_value + distance
 
     def _tighten_stop(self, trade: dict, candidate_stop: float) -> bool:
         current_stop = float(trade.get("stop_price", trade.get("initial_stop_price", 0.0)) or 0.0)
