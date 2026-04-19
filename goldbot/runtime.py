@@ -148,6 +148,11 @@ class GoldBotRuntime:
             return
         try:
             self.telegram_client.service_once(heartbeat_minutes=self.telegram_status_heartbeat_minutes)
+        except requests.exceptions.RequestException as exc:
+            # Transient network failure to api.telegram.org -- drop it at
+            # warning level instead of dumping a 70-line traceback every time
+            # Telegram read-times-out. The next cycle will retry.
+            log.warning("Gold Telegram service skipped (network): %s", exc)
         except Exception as exc:
             log.exception("Gold Telegram service failed: %s", exc)
 

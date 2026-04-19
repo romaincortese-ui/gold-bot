@@ -287,3 +287,28 @@ def test_status_message_surfaces_broker_snapshot_error(tmp_path, monkeypatch) ->
     assert "📉 Unrealized: GBP120.00" in message
     assert "Margin used: GBP220.00" in message
     assert "Margin available: GBP10,880.00" in message
+
+
+def test_poll_commands_swallows_read_timeout(tmp_path, monkeypatch, caplog) -> None:
+    """Regression for the 80-line ReadTimeout traceback observed on 2026-04-19:
+    a single transient api.telegram.org hiccup must not raise out of
+    poll_commands; it should log a one-line warning and return."""
+    import logging
+    import requests
+
+    client = GoldTelegramClient(
+        token="token",
+        chat_id="123",
+        state_path=tmp_path / "state.json",
+        offset_path=tmp_path / "telegram_state.json",
+    )
+
+    def _boom(*_args, **_kwargs):
+        raise requests.exceptions.ReadTimeout("simulated read timeout")
+
+    monkeypatch.setattr(telegram_module.requests, "get", _boom)
+
+    with caplog.at_level(logging.WARNING, logger="goldbot.telegram"):
+        client.poll_commands()  # must not raise
+
+    assert any("Gold Telegram poll skipped" in rec.message for rec in caplog.records)

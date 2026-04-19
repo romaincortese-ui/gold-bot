@@ -92,13 +92,21 @@ class GoldTelegramClient:
     def poll_commands(self) -> None:
         offset = self._load_offset()
         last_update_id = int(offset.get("last_update_id", 0) or 0)
-        response = requests.get(
-            f"{self.base_url}/getUpdates",
-            params={"offset": last_update_id + 1, "timeout": 1},
-            timeout=5,
-        )
-        response.raise_for_status()
-        payload = response.json()
+        # Long-poll Telegram up to 1s; allow up to 15s for the full HTTP round-trip
+        # so a normal jitter spike doesn't raise ReadTimeout. Transient network
+        # errors are swallowed at warning level -- this is a poll loop, the next
+        # cycle will try again.
+        try:
+            response = requests.get(
+                f"{self.base_url}/getUpdates",
+                params={"offset": last_update_id + 1, "timeout": 1},
+                timeout=15,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except requests.exceptions.RequestException as exc:
+            log.warning("Gold Telegram poll skipped: %s", exc)
+            return
         for update in payload.get("result", []):
             update_id = int(update.get("update_id", 0) or 0)
             offset["last_update_id"] = update_id
@@ -113,6 +121,9 @@ class GoldTelegramClient:
                 self.send_message(reply)
 
     def send_message(self, message: str) -> None:
+        # Bumped from 10s to 15s to tolerate normal network jitter. Exceptions
+        # still propagate so flush_new_events() only adds to sent_event_ids on
+        # success -- a transient timeout must be re-tried on the next cycle.
         response = requests.post(
             f"{self.base_url}/sendMessage",
             json={
@@ -121,7 +132,7 @@ class GoldTelegramClient:
                 "parse_mode": "HTML",
                 "disable_web_page_preview": True,
             },
-            timeout=10,
+            timeout=15,
         )
         response.raise_for_status()
 
