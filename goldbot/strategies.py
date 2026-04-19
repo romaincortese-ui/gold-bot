@@ -55,27 +55,90 @@ def score_macro_breakout(
         for event in events
         if now - timedelta(hours=settings.breakout_news_lookback_hours) <= event.occurs_at <= now - timedelta(minutes=settings.post_news_settle_minutes)
     ]
-    if not recent_events:
+    session_open_mode = False
+    latest_event = None
+    box_hours_used = settings.breakout_box_hours
+    if recent_events:
+        latest_event = recent_events[-1]
+        pre_event_end = latest_event.occurs_at
+        pre_event_start = pre_event_end - timedelta(hours=settings.breakout_box_hours)
+        box_slice = df_h1[(df_h1["time"] >= pre_event_start) & (df_h1["time"] < pre_event_end)]
+    elif getattr(settings, "breakout_allow_session_open", False):
+        # Session-open consolidation breakout: don't require a scheduled news
+        # event. Only fire on the H1 candle that just closed at the London or
+        # NY session open (the hours listed in breakout_session_open_hours_utc).
+        try:
+            allowed_hours = {
+                int(h) for h in (settings.breakout_session_open_hours_utc or "").split(",") if h.strip()
+            }
+        except ValueError:
+            allowed_hours = set()
+        if not allowed_hours or now.hour not in allowed_hours:
+            _reject(reasons, strategy, f"no_eligible_news_events_and_not_session_open(h={now.hour})")
+            return None
+        session_open_mode = True
+        box_hours_sess = int(
+            getattr(settings, "breakout_session_open_box_hours", settings.breakout_box_hours)
+        )
+        box_hours_used = box_hours_sess
+        # Anchor the box to the MOST RECENT session-open hour that has already
+        # occurred (the London or NY open preceding `now`), not to `now`
+        # itself. This way, as the session progresses we keep testing whether
+        # current price has broken out of the pre-session consolidation.
+        session_open_anchor_hours = sorted({int(x) for x in (7, 12)})
+        anchor_hour = max(
+            (h for h in session_open_anchor_hours if h <= now.hour),
+            default=session_open_anchor_hours[0],
+        )
+        box_end = now.replace(hour=anchor_hour, minute=0, second=0, microsecond=0)
+        box_start = box_end - timedelta(hours=box_hours_sess)
+        box_slice = df_h1[(df_h1["time"] >= box_start) & (df_h1["time"] < box_end)]
+    else:
         _reject(reasons, strategy, "no_eligible_news_events")
         return None
 
-    latest_event = recent_events[-1]
-    pre_event_end = latest_event.occurs_at
-    pre_event_start = pre_event_end - timedelta(hours=settings.breakout_box_hours)
-    box_slice = df_h1[(df_h1["time"] >= pre_event_start) & (df_h1["time"] < pre_event_end)]
-    if len(box_slice) < max(8, settings.breakout_box_hours // 2):
+    if len(box_slice) < max(4 if session_open_mode else 8, box_hours_used // 2):
         _reject(reasons, strategy, "box_slice_too_small")
         return None
 
-    box = consolidation_box(box_slice, len(box_slice), settings.atr_period)
-    if box["width_atr_ratio"] <= 0 or box["width_atr_ratio"] > settings.breakout_min_box_atr_ratio:
-        _reject(reasons, strategy, f"box_width_atr_ratio={box['width_atr_ratio']:.2f}>{settings.breakout_min_box_atr_ratio}")
+    # For session-open mode the box slice is shorter than the ATR window
+    # (14), which makes calc_atr inside consolidation_box return 0 and every
+    # candidate gets rejected. Compute high/low from the narrower pre-session
+    # slice but take ATR from the broader H1 context so the ratio is valid.
+    if session_open_mode:
+        session_atr = calc_atr(df_h1, settings.atr_period)
+        if session_atr <= 0:
+            _reject(reasons, strategy, "session_atr_zero")
+            return None
+        box_high = float(box_slice["high"].max())
+        box_low = float(box_slice["low"].min())
+        box_width = box_high - box_low
+        box = {
+            "high": box_high,
+            "low": box_low,
+            "width": box_width,
+            "atr": session_atr,
+            "width_atr_ratio": box_width / session_atr if session_atr > 0 else 0.0,
+        }
+    else:
+        box = consolidation_box(box_slice, len(box_slice), settings.atr_period)
+    box_width_limit = (
+        float(getattr(settings, "breakout_session_open_min_box_atr_ratio", settings.breakout_min_box_atr_ratio))
+        if session_open_mode
+        else settings.breakout_min_box_atr_ratio
+    )
+    if box["width_atr_ratio"] <= 0 or box["width_atr_ratio"] > box_width_limit:
+        _reject(reasons, strategy, f"box_width_atr_ratio={box['width_atr_ratio']:.2f}>{box_width_limit}")
         return None
 
     atr = calc_atr(df_m15, settings.atr_period)
     buffer_size = atr * settings.breakout_buffer_atr
     last_close = float(df_m15["close"].iloc[-1])
-    recent_closes = df_m15["close"].tail(3)
+    # Session-open breakouts often only print 1-2 M15 closes outside the box
+    # before the initial thrust — demanding 3 consecutive closes rejected 61
+    # otherwise-valid setups in the validation window.
+    closes_window = 2 if session_open_mode else 3
+    recent_closes = df_m15["close"].tail(closes_window)
     breakout_volume = float(df_m15["volume"].iloc[-1])
     avg_volume = float(df_m15["volume"].iloc[-21:-1].mean()) if len(df_m15) >= 21 else breakout_volume
     volume_ratio = breakout_volume / avg_volume if avg_volume > 0 else 1.0
@@ -84,10 +147,35 @@ def score_macro_breakout(
         _reject(reasons, strategy, f"volume_ratio={volume_ratio:.2f}<{settings.breakout_min_volume_ratio}")
         return None
 
+    event_label = latest_event.title if latest_event is not None else ("SESSION_OPEN" if session_open_mode else "")
+    rationale_prefix = (
+        f"Session-open break above {box['high']:.2f}"
+        if session_open_mode
+        else f"Post-news break above {box['high']:.2f} after {latest_event.title}"
+    )
+
+    # Session-open breakouts against the prevailing H4 trend are a common
+    # fade; validation showed a counter-trend short losing $26 while aligned
+    # longs won. Gate directionality on H4 EMA trend when there's no scheduled
+    # news (news-driven moves can legitimately fade the prior trend).
+    trend_direction_hint: str | None = None
+    if session_open_mode and len(df_h1) >= settings.trend_ema_fast + 5:
+        _ema_fast_h1 = calc_ema(df_h1["close"], settings.trend_ema_fast).iloc[-1]
+        _ema_slow_h1 = calc_ema(df_h1["close"], max(settings.trend_ema_fast * 2, 100)).iloc[-1]
+        if float(_ema_fast_h1) > float(_ema_slow_h1):
+            trend_direction_hint = "LONG"
+        elif float(_ema_fast_h1) < float(_ema_slow_h1):
+            trend_direction_hint = "SHORT"
+
     if last_close > box["high"] + buffer_size and float(recent_closes.min()) > box["high"]:
+        if session_open_mode and trend_direction_hint == "SHORT":
+            _reject(reasons, strategy, "long_break_against_h1_trend")
+            return None
         stop_price = box["low"] - buffer_size
         risk = last_close - stop_price
         score = 70 + min(20, ((last_close - box["high"]) / max(atr, 1e-9)) * 10)
+        if session_open_mode:
+            score -= 5  # modestly discount non-news breakouts
         return Opportunity(
             strategy="MACRO_BREAKOUT",
             direction="LONG",
@@ -96,9 +184,9 @@ def score_macro_breakout(
             stop_price=stop_price,
             take_profit_price=None,
             risk_per_unit=risk,
-            rationale=f"Post-news break above {box['high']:.2f} after {latest_event.title}",
+            rationale=rationale_prefix,
             metadata={
-                "event": latest_event.title,
+                "event": event_label,
                 "box_high": box["high"],
                 "box_low": box["low"],
                 "atr": atr,
@@ -108,9 +196,19 @@ def score_macro_breakout(
             exit_plan=_build_exit_plan(settings, "LONG", last_close, risk, atr, timeframe="M15"),
         )
     if last_close < box["low"] - buffer_size and float(recent_closes.max()) < box["low"]:
+        if session_open_mode and trend_direction_hint == "LONG":
+            _reject(reasons, strategy, "short_break_against_h1_trend")
+            return None
         stop_price = box["high"] + buffer_size
         risk = stop_price - last_close
         score = 70 + min(20, ((box["low"] - last_close) / max(atr, 1e-9)) * 10)
+        if session_open_mode:
+            score -= 5
+        rationale_short = (
+            f"Session-open break below {box['low']:.2f}"
+            if session_open_mode
+            else f"Post-news break below {box['low']:.2f} after {latest_event.title}"
+        )
         return Opportunity(
             strategy="MACRO_BREAKOUT",
             direction="SHORT",
@@ -119,9 +217,9 @@ def score_macro_breakout(
             stop_price=stop_price,
             take_profit_price=None,
             risk_per_unit=risk,
-            rationale=f"Post-news break below {box['low']:.2f} after {latest_event.title}",
+            rationale=rationale_short,
             metadata={
-                "event": latest_event.title,
+                "event": event_label,
                 "box_high": box["high"],
                 "box_low": box["low"],
                 "atr": atr,
@@ -178,8 +276,8 @@ def score_exhaustion_reversal(settings: Settings, df_h4: pd.DataFrame, df_d1: pd
     levels = nearest_support_resistance(df_d1, settings.exhaustion_sr_lookback)
     divergence = detect_divergence(df_h4, lookback=50)
 
-    near_resistance = abs(price - levels["resistance"]) <= atr
-    near_support = abs(price - levels["support"]) <= atr
+    near_resistance = abs(price - levels["resistance"]) <= atr * getattr(settings, "exhaustion_near_sr_atr_mult", 1.0)
+    near_support = abs(price - levels["support"]) <= atr * getattr(settings, "exhaustion_near_sr_atr_mult", 1.0)
 
     if divergence["bearish"] and near_resistance and rsi_h4 >= settings.exhaustion_rsi_overbought:
         stop_price = levels["resistance"] + atr * 0.5
@@ -263,16 +361,50 @@ def score_trend_pullback(
     h1_confirm_value = float(h1_confirm_ema.iloc[-1])
     usd_regime_bias = compute_usd_regime_bias(settings, usd_proxy_h4)
 
+    # EMA reclaim check (P5): a candle that dipped into the H1 EMA and then
+    # closed back above it by a modest ATR-buffer, with RSI filter, is a
+    # standard gold pullback trigger used by prop desks. Symmetric for short.
+    h1_ema_fast = calc_ema(df_h1["close"], settings.trend_h1_confirm_ema_period)
+    last_bar = df_h1.iloc[-1]
+    prev_bar = df_h1.iloc[-2] if len(df_h1) >= 2 else last_bar
+    h1_rsi = calc_rsi(df_h1["close"])
+    atr_h1 = calc_atr(df_h1, settings.atr_period)
+    h1_ema_last = float(h1_ema_fast.iloc[-1])
+    h1_ema_prev = float(h1_ema_fast.iloc[-2]) if len(h1_ema_fast) >= 2 else h1_ema_last
+
+    ema_reclaim_bull = False
+    ema_reclaim_bear = False
+    if getattr(settings, "trend_allow_ema_reclaim", False) and atr_h1 > 0:
+        break_atr = float(getattr(settings, "trend_ema_reclaim_break_atr", 0.10))
+        touch_atr = float(getattr(settings, "trend_ema_reclaim_touch_atr", 0.50))
+        rsi_min = float(getattr(settings, "trend_ema_reclaim_rsi_min", 45.0))
+        # bull reclaim: current H1 low (or prior close) touched/pierced EMA within
+        # touch_atr, and current close finished above EMA by >= break_atr * ATR.
+        touched_from_above = (
+            float(last_bar["low"]) <= h1_ema_last + atr_h1 * 0.05
+            or float(prev_bar["close"]) <= h1_ema_prev + atr_h1 * touch_atr
+        )
+        closed_above = float(last_bar["close"]) >= h1_ema_last + atr_h1 * break_atr
+        if touched_from_above and closed_above and h1_rsi >= rsi_min:
+            ema_reclaim_bull = True
+        touched_from_below = (
+            float(last_bar["high"]) >= h1_ema_last - atr_h1 * 0.05
+            or float(prev_bar["close"]) >= h1_ema_prev - atr_h1 * touch_atr
+        )
+        closed_below = float(last_bar["close"]) <= h1_ema_last - atr_h1 * break_atr
+        if touched_from_below and closed_below and h1_rsi <= (100.0 - rsi_min):
+            ema_reclaim_bear = True
+
     bull_confirm = is_bullish_engulfing(df_h1) or is_pin_bar(df_h1, "LONG") or (
         settings.trend_allow_inside_bar_confirmation
         and is_inside_bar(df_h1)
         and trigger_price > float(df_h1["close"].iloc[-2])
-    )
+    ) or ema_reclaim_bull
     bear_confirm = is_bearish_engulfing(df_h1) or is_pin_bar(df_h1, "SHORT") or (
         settings.trend_allow_inside_bar_confirmation
         and is_inside_bar(df_h1)
         and trigger_price < float(df_h1["close"].iloc[-2])
-    )
+    ) or ema_reclaim_bear
 
     if bullish_trend and bull_confirm:
         if ema_fast_slope_atr < settings.trend_min_slope_atr:

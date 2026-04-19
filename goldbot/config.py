@@ -133,6 +133,27 @@ class Settings:
     asia_active_end_utc: int = 6
     # --- P1: accept H1 inside-bar as a pullback confirmation candle ---
     trend_allow_inside_bar_confirmation: bool = True
+    # --- P5 (post-review Apr 2026): gold pros enter pullbacks on a simple
+    # "close back above 50 EMA with RSI > 40" pattern. The textbook engulfing/
+    # pin-bar filter is too strict (189 misses in 15-day window). Allow EMA
+    # reclaim as an alternative confirmation signal.
+    trend_allow_ema_reclaim: bool = True
+    trend_ema_reclaim_rsi_min: float = 45.0
+    trend_ema_reclaim_break_atr: float = 0.10
+    trend_ema_reclaim_touch_atr: float = 0.50
+    # --- P5: MACRO_BREAKOUT was blocking 92% of eligible hours because it
+    # requires a scheduled news event within the lookback. Pros trade
+    # consolidation breakouts at session opens without news as well. Allow a
+    # "session open" breakout mode that builds the box from the last N hours
+    # ending at the London/NY/overlap open.
+    breakout_allow_session_open: bool = True
+    breakout_session_open_hours_utc: str = "7,8,9,12,13,14,15"
+    breakout_session_open_box_hours: int = 8
+    breakout_session_open_min_box_atr_ratio: float = 2.75
+    # --- P5: widen the near-support/near-resistance tolerance for exhaustion
+    # reversals (default was exactly 1*ATR which never triggered in the
+    # 15-day window). Pros treat 1.2-1.5 ATR as "near" in high-vol gold.
+    exhaustion_near_sr_atr_mult: float = 1.3
 
 
 def load_settings() -> Settings:
@@ -215,6 +236,15 @@ def load_settings() -> Settings:
         asia_active_start_utc=env_int("ASIA_ACTIVE_START_UTC", 1),
         asia_active_end_utc=env_int("ASIA_ACTIVE_END_UTC", 6),
         trend_allow_inside_bar_confirmation=env_bool("TREND_ALLOW_INSIDE_BAR_CONFIRMATION", True),
+        trend_allow_ema_reclaim=env_bool("TREND_ALLOW_EMA_RECLAIM", True),
+        trend_ema_reclaim_rsi_min=env_float("TREND_EMA_RECLAIM_RSI_MIN", 45.0),
+        trend_ema_reclaim_break_atr=env_float("TREND_EMA_RECLAIM_BREAK_ATR", 0.10),
+        trend_ema_reclaim_touch_atr=env_float("TREND_EMA_RECLAIM_TOUCH_ATR", 0.50),
+        breakout_allow_session_open=env_bool("BREAKOUT_ALLOW_SESSION_OPEN", True),
+        breakout_session_open_hours_utc=env_str("BREAKOUT_SESSION_OPEN_HOURS_UTC", "7,8,9,12,13,14,15"),
+        breakout_session_open_box_hours=env_int("BREAKOUT_SESSION_OPEN_BOX_HOURS", 8),
+        breakout_session_open_min_box_atr_ratio=env_float("BREAKOUT_SESSION_OPEN_MIN_BOX_ATR_RATIO", 2.75),
+        exhaustion_near_sr_atr_mult=env_float("EXHAUSTION_NEAR_SR_ATR_MULT", 1.3),
     )
     _validate_settings(settings)
     return settings
