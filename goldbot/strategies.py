@@ -13,6 +13,7 @@ from goldbot.indicators import (
     detect_divergence,
     is_bearish_engulfing,
     is_bullish_engulfing,
+    is_inside_bar,
     is_pin_bar,
     nearest_support_resistance,
 )
@@ -27,6 +28,11 @@ USD_PROXY_COMPONENTS: tuple[tuple[str, float], ...] = (
 )
 
 
+def _reject(reasons: list[str] | None, strategy: str, reason: str) -> None:
+    if reasons is not None:
+        reasons.append(f"{strategy}:{reason}")
+
+
 def score_macro_breakout(
     settings: Settings,
     now: datetime,
@@ -35,10 +41,14 @@ def score_macro_breakout(
     df_h1: pd.DataFrame,
     events: list[CalendarEvent],
     breakout_volume_signal: BreakoutVolumeSignal | None = None,
+    reasons: list[str] | None = None,
 ) -> Opportunity | None:
+    strategy = "MACRO_BREAKOUT"
     if df_m15 is None or df_h1 is None or len(df_m15) < 40 or len(df_h1) < settings.breakout_box_hours + 8:
+        _reject(reasons, strategy, "insufficient_candles")
         return None
     if settings.breakout_overlap_only and session_name != "OVERLAP":
+        _reject(reasons, strategy, f"session_not_overlap({session_name})")
         return None
     recent_events = [
         event
@@ -46,6 +56,7 @@ def score_macro_breakout(
         if now - timedelta(hours=settings.breakout_news_lookback_hours) <= event.occurs_at <= now - timedelta(minutes=settings.post_news_settle_minutes)
     ]
     if not recent_events:
+        _reject(reasons, strategy, "no_eligible_news_events")
         return None
 
     latest_event = recent_events[-1]
@@ -53,10 +64,12 @@ def score_macro_breakout(
     pre_event_start = pre_event_end - timedelta(hours=settings.breakout_box_hours)
     box_slice = df_h1[(df_h1["time"] >= pre_event_start) & (df_h1["time"] < pre_event_end)]
     if len(box_slice) < max(8, settings.breakout_box_hours // 2):
+        _reject(reasons, strategy, "box_slice_too_small")
         return None
 
     box = consolidation_box(box_slice, len(box_slice), settings.atr_period)
     if box["width_atr_ratio"] <= 0 or box["width_atr_ratio"] > settings.breakout_min_box_atr_ratio:
+        _reject(reasons, strategy, f"box_width_atr_ratio={box['width_atr_ratio']:.2f}>{settings.breakout_min_box_atr_ratio}")
         return None
 
     atr = calc_atr(df_m15, settings.atr_period)
@@ -68,6 +81,7 @@ def score_macro_breakout(
     volume_ratio = breakout_volume / avg_volume if avg_volume > 0 else 1.0
     volume_confirmation = _confirm_breakout_volume(settings, volume_ratio, breakout_volume_signal)
     if volume_confirmation is None:
+        _reject(reasons, strategy, f"volume_ratio={volume_ratio:.2f}<{settings.breakout_min_volume_ratio}")
         return None
 
     if last_close > box["high"] + buffer_size and float(recent_closes.min()) > box["high"]:
@@ -116,6 +130,7 @@ def score_macro_breakout(
             },
             exit_plan=_build_exit_plan(settings, "SHORT", last_close, risk, atr, timeframe="M15"),
         )
+    _reject(reasons, "MACRO_BREAKOUT", "no_breakout_direction")
     return None
 
 
@@ -151,8 +166,10 @@ def _confirm_breakout_volume(
     }
 
 
-def score_exhaustion_reversal(settings: Settings, df_h4: pd.DataFrame, df_d1: pd.DataFrame) -> Opportunity | None:
+def score_exhaustion_reversal(settings: Settings, df_h4: pd.DataFrame, df_d1: pd.DataFrame, reasons: list[str] | None = None) -> Opportunity | None:
+    strategy = "EXHAUSTION_REVERSAL"
     if df_h4 is None or df_d1 is None or len(df_h4) < 80 or len(df_d1) < 40:
+        _reject(reasons, strategy, "insufficient_candles")
         return None
     price = float(df_h4["close"].iloc[-1])
     atr = calc_atr(df_h4, settings.atr_period)
@@ -197,6 +214,11 @@ def score_exhaustion_reversal(settings: Settings, df_h4: pd.DataFrame, df_d1: pd
             metadata={"rsi": rsi_h4, "support": levels["support"], "atr": atr},
             exit_plan=_build_exit_plan(settings, "LONG", price, risk, atr, timeframe="H1"),
         )
+    _reject(
+        reasons,
+        "EXHAUSTION_REVERSAL",
+        f"no_setup(rsi={rsi_h4:.1f},div_bull={divergence['bullish']},div_bear={divergence['bearish']},near_sup={near_support},near_res={near_resistance})",
+    )
     return None
 
 
@@ -205,8 +227,11 @@ def score_trend_pullback(
     df_h1: pd.DataFrame,
     df_h4: pd.DataFrame,
     usd_proxy_h4: dict[str, pd.DataFrame] | None = None,
+    reasons: list[str] | None = None,
 ) -> Opportunity | None:
+    strategy = "TREND_PULLBACK"
     if df_h1 is None or df_h4 is None or len(df_h1) < 80 or len(df_h4) < settings.trend_ema_slow + 5:
+        _reject(reasons, strategy, "insufficient_candles")
         return None
     close_h4 = df_h4["close"]
     ema_fast = calc_ema(close_h4, settings.trend_ema_fast)
@@ -215,33 +240,58 @@ def score_trend_pullback(
     trigger_price = float(df_h1["close"].iloc[-1])
     atr_h4 = calc_atr(df_h4, settings.atr_period)
     if atr_h4 <= 0:
+        _reject(reasons, strategy, "zero_atr")
         return None
 
     bullish_trend = float(ema_fast.iloc[-1]) > float(ema_slow.iloc[-1])
     bearish_trend = float(ema_fast.iloc[-1]) < float(ema_slow.iloc[-1])
     if not bullish_trend and not bearish_trend:
+        _reject(reasons, strategy, "no_trend_direction")
         return None
 
     ema_fast_value = float(ema_fast.iloc[-1])
     ema_slow_value = float(ema_slow.iloc[-1])
     trend_strength = abs(ema_fast_value - ema_slow_value) / atr_h4
     if trend_strength < settings.trend_min_strength_atr:
+        _reject(reasons, strategy, f"trend_strength={trend_strength:.2f}<{settings.trend_min_strength_atr}")
         return None
     slope_bars = min(settings.trend_fast_slope_bars, len(ema_fast) - 1)
     if slope_bars <= 0:
+        _reject(reasons, strategy, "slope_bars_zero")
         return None
     ema_fast_slope_atr = (ema_fast_value - float(ema_fast.iloc[-(slope_bars + 1)])) / atr_h4
     h1_confirm_value = float(h1_confirm_ema.iloc[-1])
     usd_regime_bias = compute_usd_regime_bias(settings, usd_proxy_h4)
 
-    if bullish_trend and (is_bullish_engulfing(df_h1) or is_pin_bar(df_h1, "LONG")):
-        if ema_fast_slope_atr < settings.trend_min_slope_atr or trigger_price < h1_confirm_value:
+    bull_confirm = is_bullish_engulfing(df_h1) or is_pin_bar(df_h1, "LONG") or (
+        settings.trend_allow_inside_bar_confirmation
+        and is_inside_bar(df_h1)
+        and trigger_price > float(df_h1["close"].iloc[-2])
+    )
+    bear_confirm = is_bearish_engulfing(df_h1) or is_pin_bar(df_h1, "SHORT") or (
+        settings.trend_allow_inside_bar_confirmation
+        and is_inside_bar(df_h1)
+        and trigger_price < float(df_h1["close"].iloc[-2])
+    )
+
+    if bullish_trend and bull_confirm:
+        if ema_fast_slope_atr < settings.trend_min_slope_atr:
+            _reject(reasons, strategy, f"ema_fast_slope_atr={ema_fast_slope_atr:.3f}<{settings.trend_min_slope_atr}")
             return None
-        if settings.usd_regime_filter_enabled and usd_regime_bias is not None and usd_regime_bias >= settings.usd_regime_min_bias_atr:
+        if trigger_price < h1_confirm_value:
+            _reject(reasons, strategy, "h1_close_below_ema")
             return None
+        usd_risk_mult = 1.0
+        if settings.usd_regime_filter_enabled and usd_regime_bias is not None:
+            if usd_regime_bias >= settings.usd_regime_hard_veto_atr:
+                _reject(reasons, strategy, f"usd_regime_bias={usd_regime_bias:.2f}>=hard_veto")
+                return None
+            if usd_regime_bias >= settings.usd_regime_min_bias_atr:
+                usd_risk_mult = settings.usd_regime_adverse_risk_multiplier
         support_probe = float(df_h1["low"].tail(3).min())
         pullback_gap = abs(support_probe - ema_fast_value)
         if pullback_gap > atr_h4 * settings.trend_pullback_atr_tolerance:
+            _reject(reasons, strategy, f"pullback_gap={pullback_gap/atr_h4:.2f}ATR>{settings.trend_pullback_atr_tolerance}")
             return None
         stop_price = min(float(df_h1["low"].tail(5).min()), float(ema_fast.iloc[-1])) - atr_h4 * 0.6
         risk = trigger_price - stop_price
@@ -262,18 +312,29 @@ def score_trend_pullback(
                 "trend_strength_atr": round(trend_strength, 3),
                 "ema_fast_slope_atr": round(ema_fast_slope_atr, 3),
                 "usd_regime_bias_atr": round(usd_regime_bias, 3) if usd_regime_bias is not None else None,
+                "risk_multiplier": usd_risk_mult,
             },
             exit_plan=_build_exit_plan(settings, "LONG", trigger_price, risk, atr_h4, timeframe="H1"),
         )
 
-    if bearish_trend and (is_bearish_engulfing(df_h1) or is_pin_bar(df_h1, "SHORT")):
-        if ema_fast_slope_atr > -settings.trend_min_slope_atr or trigger_price > h1_confirm_value:
+    if bearish_trend and bear_confirm:
+        if ema_fast_slope_atr > -settings.trend_min_slope_atr:
+            _reject(reasons, strategy, f"ema_fast_slope_atr={ema_fast_slope_atr:.3f}>-{settings.trend_min_slope_atr}")
             return None
-        if settings.usd_regime_filter_enabled and usd_regime_bias is not None and usd_regime_bias <= -settings.usd_regime_min_bias_atr:
+        if trigger_price > h1_confirm_value:
+            _reject(reasons, strategy, "h1_close_above_ema")
             return None
+        usd_risk_mult = 1.0
+        if settings.usd_regime_filter_enabled and usd_regime_bias is not None:
+            if usd_regime_bias <= -settings.usd_regime_hard_veto_atr:
+                _reject(reasons, strategy, f"usd_regime_bias={usd_regime_bias:.2f}<=-hard_veto")
+                return None
+            if usd_regime_bias <= -settings.usd_regime_min_bias_atr:
+                usd_risk_mult = settings.usd_regime_adverse_risk_multiplier
         resistance_probe = float(df_h1["high"].tail(3).max())
         pullback_gap = abs(resistance_probe - ema_fast_value)
         if pullback_gap > atr_h4 * settings.trend_pullback_atr_tolerance:
+            _reject(reasons, strategy, f"pullback_gap={pullback_gap/atr_h4:.2f}ATR>{settings.trend_pullback_atr_tolerance}")
             return None
         stop_price = max(float(df_h1["high"].tail(5).max()), float(ema_fast.iloc[-1])) + atr_h4 * 0.6
         risk = stop_price - trigger_price
@@ -294,9 +355,11 @@ def score_trend_pullback(
                 "trend_strength_atr": round(trend_strength, 3),
                 "ema_fast_slope_atr": round(ema_fast_slope_atr, 3),
                 "usd_regime_bias_atr": round(usd_regime_bias, 3) if usd_regime_bias is not None else None,
+                "risk_multiplier": usd_risk_mult,
             },
             exit_plan=_build_exit_plan(settings, "SHORT", trigger_price, risk, atr_h4, timeframe="H1"),
         )
+    _reject(reasons, strategy, "no_confirmation_candle")
     return None
 
 

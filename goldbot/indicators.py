@@ -149,3 +149,15 @@ def is_pin_bar(df: pd.DataFrame, direction: str) -> bool:
     if direction == "LONG":
         return lower_wick >= body * 2 and lower_wick / full_range >= 0.5
     return upper_wick >= body * 2 and upper_wick / full_range >= 0.5
+
+
+def is_inside_bar(df: pd.DataFrame) -> bool:
+    """Return True when the last candle's high/low is contained by the previous candle's range."""
+    if len(df) < 2:
+        return False
+    prev_candle = df.iloc[-2]
+    last_candle = df.iloc[-1]
+    return (
+        float(last_candle["high"]) <= float(prev_candle["high"])
+        and float(last_candle["low"]) >= float(prev_candle["low"])
+    )

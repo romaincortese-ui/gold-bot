@@ -124,6 +124,15 @@ class Settings:
     real_yield_reduce_risk_bps: float = 7.5
     real_yield_veto_bps: float = 15.0
     real_yield_adverse_risk_multiplier: float = 0.5
+    # --- P3: USD regime soft/hard veto ---
+    usd_regime_hard_veto_atr: float = 0.70
+    usd_regime_adverse_risk_multiplier: float = 0.5
+    # --- P4: limited ASIA scanning ---
+    scan_asia_active: bool = True
+    asia_active_start_utc: int = 1
+    asia_active_end_utc: int = 6
+    # --- P1: accept H1 inside-bar as a pullback confirmation candle ---
+    trend_allow_inside_bar_confirmation: bool = True
 
 
 def load_settings() -> Settings:
@@ -148,7 +157,7 @@ def load_settings() -> Settings:
         ny_close_utc=env_int("NY_CLOSE_UTC", 21),
         overlap_start_utc=env_int("OVERLAP_START_UTC", 12),
         overlap_end_utc=env_int("OVERLAP_END_UTC", 16),
-        breakout_news_lookback_hours=env_int("BREAKOUT_NEWS_LOOKBACK_HOURS", 8),
+        breakout_news_lookback_hours=env_int("BREAKOUT_NEWS_LOOKBACK_HOURS", 24),
         breakout_news_lookahead_hours=env_int("BREAKOUT_NEWS_LOOKAHEAD_HOURS", 24),
         pre_news_pause_minutes=env_int("PRE_NEWS_PAUSE_MINUTES", 30),
         post_news_settle_minutes=env_int("POST_NEWS_SETTLE_MINUTES", 20),
@@ -167,8 +176,8 @@ def load_settings() -> Settings:
         trend_h1_confirm_ema_period=env_int("TREND_H1_CONFIRM_EMA_PERIOD", 50),
         trend_min_strength_atr=env_float("TREND_MIN_STRENGTH_ATR", 1.0),
         trend_fast_slope_bars=env_int("TREND_FAST_SLOPE_BARS", 3),
-        trend_min_slope_atr=env_float("TREND_MIN_SLOPE_ATR", 0.10),
-        trend_pullback_atr_tolerance=env_float("TREND_PULLBACK_ATR_TOLERANCE", 0.65),
+        trend_min_slope_atr=env_float("TREND_MIN_SLOPE_ATR", 0.06),
+        trend_pullback_atr_tolerance=env_float("TREND_PULLBACK_ATR_TOLERANCE", 0.85),
         trend_stopout_cooldown_hours=env_int("TREND_STOPOUT_COOLDOWN_HOURS", 48),
         usd_regime_filter_enabled=env_bool("USD_REGIME_FILTER_ENABLED", True),
         usd_regime_fast_ema=env_int("USD_REGIME_FAST_EMA", 20),
@@ -200,6 +209,12 @@ def load_settings() -> Settings:
         real_yield_reduce_risk_bps=env_float("REAL_YIELD_REDUCE_RISK_BPS", 7.5),
         real_yield_veto_bps=env_float("REAL_YIELD_VETO_BPS", 15.0),
         real_yield_adverse_risk_multiplier=env_float("REAL_YIELD_ADVERSE_RISK_MULTIPLIER", 0.5),
+        usd_regime_hard_veto_atr=env_float("USD_REGIME_HARD_VETO_ATR", 0.70),
+        usd_regime_adverse_risk_multiplier=env_float("USD_REGIME_ADVERSE_RISK_MULTIPLIER", 0.5),
+        scan_asia_active=env_bool("SCAN_ASIA_ACTIVE", True),
+        asia_active_start_utc=env_int("ASIA_ACTIVE_START_UTC", 1),
+        asia_active_end_utc=env_int("ASIA_ACTIVE_END_UTC", 6),
+        trend_allow_inside_bar_confirmation=env_bool("TREND_ALLOW_INSIDE_BAR_CONFIRMATION", True),
     )
     _validate_settings(settings)
     return settings
@@ -258,5 +273,13 @@ def _validate_settings(settings: Settings) -> None:
         raise ValueError("REAL_YIELD_VETO_BPS must be >= REAL_YIELD_REDUCE_RISK_BPS")
     if settings.real_yield_adverse_risk_multiplier <= 0 or settings.real_yield_adverse_risk_multiplier > 1:
         raise ValueError("REAL_YIELD_ADVERSE_RISK_MULTIPLIER must be > 0 and <= 1")
+    if settings.usd_regime_hard_veto_atr < settings.usd_regime_min_bias_atr:
+        raise ValueError("USD_REGIME_HARD_VETO_ATR must be >= USD_REGIME_MIN_BIAS_ATR")
+    if settings.usd_regime_adverse_risk_multiplier <= 0 or settings.usd_regime_adverse_risk_multiplier > 1:
+        raise ValueError("USD_REGIME_ADVERSE_RISK_MULTIPLIER must be > 0 and <= 1")
+    if settings.asia_active_start_utc < 0 or settings.asia_active_end_utc > 24:
+        raise ValueError("ASIA_ACTIVE_START_UTC / ASIA_ACTIVE_END_UTC must be within 0..24")
+    if settings.asia_active_end_utc <= settings.asia_active_start_utc:
+        raise ValueError("ASIA_ACTIVE_END_UTC must be > ASIA_ACTIVE_START_UTC")
     if settings.partial_profit_rr <= 0 or settings.break_even_rr <= 0 or settings.trailing_atr_mult <= 0:
         raise ValueError("Exit-plan multipliers must be > 0")

@@ -168,8 +168,14 @@ class GoldBotRuntime:
             self._publish_runtime_status("paused", state, balance=None)
             return None
 
-        if session_name == "ASIA" or session_name == "OFF_HOURS":
+        if session_name == "OFF_HOURS" or (session_name == "ASIA" and not self.settings.scan_asia_active):
             log.info("Skipping scan during %s session", session_name)
+            state.update({"last_run_at": now.isoformat(), "last_session": session_name})
+            self._save_state(state)
+            self._publish_runtime_status("idle", state, balance=None)
+            return None
+        if session_name == "ASIA_QUIET":
+            log.info("Skipping scan during ASIA quiet window")
             state.update({"last_run_at": now.isoformat(), "last_session": session_name})
             self._save_state(state)
             self._publish_runtime_status("idle", state, balance=None)
@@ -247,11 +253,18 @@ class GoldBotRuntime:
 
         self._refresh_calibration()
 
-        opportunities = [
-            score_macro_breakout(self.settings, now, session_name, df_m15, df_h1, relevant_events, breakout_volume_signal),
-            score_exhaustion_reversal(self.settings, df_h4, df_d1),
-            score_trend_pullback(self.settings, df_h1, df_h4, usd_proxy_frames),
-        ]
+        rejection_reasons: list[str] = []
+        if session_name == "ASIA":
+            # Limited ASIA window: only run mean-reversion / exhaustion scorer.
+            opportunities = [
+                score_exhaustion_reversal(self.settings, df_h4, df_d1, reasons=rejection_reasons),
+            ]
+        else:
+            opportunities = [
+                score_macro_breakout(self.settings, now, session_name, df_m15, df_h1, relevant_events, breakout_volume_signal, reasons=rejection_reasons),
+                score_exhaustion_reversal(self.settings, df_h4, df_d1, reasons=rejection_reasons),
+                score_trend_pullback(self.settings, df_h1, df_h4, usd_proxy_frames, reasons=rejection_reasons),
+            ]
 
         calibrated: list[Opportunity] = []
         for opportunity in opportunities:
@@ -269,8 +282,16 @@ class GoldBotRuntime:
 
         best = select_best_opportunity(calibrated)
         if best is None:
-            log.info("No XAU/USD opportunity passed filters")
-            state.update({"last_run_at": now.isoformat(), "last_session": session_name, "skip_reason": "no_signal"})
+            if rejection_reasons:
+                log.info("No XAU/USD opportunity passed filters | %s", " ; ".join(rejection_reasons))
+            else:
+                log.info("No XAU/USD opportunity passed filters")
+            state.update({
+                "last_run_at": now.isoformat(),
+                "last_session": session_name,
+                "skip_reason": "no_signal",
+                "last_filter_reasons": rejection_reasons,
+            })
             self._save_state(state)
             self._publish_runtime_status("scanning", state, balance=balance)
             return None
@@ -629,7 +650,12 @@ class GoldBotRuntime:
         if self.settings.ny_open_utc <= hour < self.settings.ny_close_utc:
             return "NEW_YORK"
         if 0 <= hour < self.settings.london_open_utc:
-            return "ASIA"
+            if (
+                self.settings.scan_asia_active
+                and self.settings.asia_active_start_utc <= hour < self.settings.asia_active_end_utc
+            ):
+                return "ASIA"
+            return "ASIA_QUIET"
         return "OFF_HOURS"
 
     def _write_state(self, update: dict) -> None:
