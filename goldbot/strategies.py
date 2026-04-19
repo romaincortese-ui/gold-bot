@@ -359,7 +359,15 @@ def score_trend_pullback(
             },
             exit_plan=_build_exit_plan(settings, "SHORT", trigger_price, risk, atr_h4, timeframe="H1"),
         )
-    _reject(reasons, strategy, "no_confirmation_candle")
+    # Tell the next log reader which side we were set up for but couldn't
+    # confirm -- it makes "why didn't the bot fire?" triage symmetric between
+    # longs and shorts, which was the explicit point of this review.
+    if bullish_trend:
+        _reject(reasons, strategy, "no_bull_confirmation_candle")
+    elif bearish_trend:
+        _reject(reasons, strategy, "no_bear_confirmation_candle")
+    else:
+        _reject(reasons, strategy, "no_confirmation_candle")
     return None
 
 
