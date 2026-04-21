@@ -297,6 +297,38 @@ class Settings:
     execution_limit_timeout_seconds: int = 3
     execution_guaranteed_stop_enabled: bool = False
 
+    # --- Q2 (Apr 2026): Tier-3 strategic items — miners overlay, 3-factor
+    # sizing model, central-bank demand tracker, cross-asset risk parity.
+    # All default-off until their macro-engine data pipelines are live.
+    miners_overlay_enabled: bool = False
+    miners_state_max_age_hours: int = 24
+    miners_confirm_threshold_pct: float = 0.005    # 0.5% miners-vs-gold divergence
+    miners_etf_flow_threshold_pct: float = 0.002   # 0.2% GLD shares-outstanding change
+    miners_score_offset: float = 6.0
+    miners_long_confirm_size_mult: float = 1.2
+
+    factor_model_enabled: bool = False
+    factor_model_state_max_age_hours: int = 168    # weekly data — 7d window
+    factor_tips_weight: float = 0.40
+    factor_dxy_weight: float = 0.35
+    factor_gld_weight: float = 0.25
+    factor_align_threshold: float = 0.40
+    factor_align_size_mult: float = 1.5
+    factor_oppose_size_mult: float = 0.5
+    factor_score_offset: float = 5.0
+
+    central_bank_flow_enabled: bool = False
+    central_bank_state_max_age_days: int = 100     # quarterly report
+    central_bank_high_demand_tonnes: float = 300.0
+    central_bank_short_veto_strategies: str = "EXHAUSTION_REVERSAL"
+
+    risk_parity_enabled: bool = False
+    risk_parity_rebalance_interval_days: int = 7
+    risk_parity_lookback_days: int = 20
+    risk_parity_min_weight: float = 0.20
+    risk_parity_max_weight: float = 0.80
+    risk_parity_rebalance_threshold: float = 0.05
+
 
 def load_settings() -> Settings:
     settings = Settings(
@@ -469,6 +501,34 @@ def load_settings() -> Settings:
         execution_limit_spread_multiplier=env_float("EXECUTION_LIMIT_SPREAD_MULTIPLIER", 1.25),
         execution_limit_timeout_seconds=env_int("EXECUTION_LIMIT_TIMEOUT_SECONDS", 3),
         execution_guaranteed_stop_enabled=env_bool("EXECUTION_GUARANTEED_STOP_ENABLED", False),
+        # Q2 knobs
+        miners_overlay_enabled=env_bool("MINERS_OVERLAY_ENABLED", False),
+        miners_state_max_age_hours=env_int("MINERS_STATE_MAX_AGE_HOURS", 24),
+        miners_confirm_threshold_pct=env_float("MINERS_CONFIRM_THRESHOLD_PCT", 0.005),
+        miners_etf_flow_threshold_pct=env_float("MINERS_ETF_FLOW_THRESHOLD_PCT", 0.002),
+        miners_score_offset=env_float("MINERS_SCORE_OFFSET", 6.0),
+        miners_long_confirm_size_mult=env_float("MINERS_LONG_CONFIRM_SIZE_MULT", 1.2),
+        factor_model_enabled=env_bool("FACTOR_MODEL_ENABLED", False),
+        factor_model_state_max_age_hours=env_int("FACTOR_MODEL_STATE_MAX_AGE_HOURS", 168),
+        factor_tips_weight=env_float("FACTOR_TIPS_WEIGHT", 0.40),
+        factor_dxy_weight=env_float("FACTOR_DXY_WEIGHT", 0.35),
+        factor_gld_weight=env_float("FACTOR_GLD_WEIGHT", 0.25),
+        factor_align_threshold=env_float("FACTOR_ALIGN_THRESHOLD", 0.40),
+        factor_align_size_mult=env_float("FACTOR_ALIGN_SIZE_MULT", 1.5),
+        factor_oppose_size_mult=env_float("FACTOR_OPPOSE_SIZE_MULT", 0.5),
+        factor_score_offset=env_float("FACTOR_SCORE_OFFSET", 5.0),
+        central_bank_flow_enabled=env_bool("CENTRAL_BANK_FLOW_ENABLED", False),
+        central_bank_state_max_age_days=env_int("CENTRAL_BANK_STATE_MAX_AGE_DAYS", 100),
+        central_bank_high_demand_tonnes=env_float("CENTRAL_BANK_HIGH_DEMAND_TONNES", 300.0),
+        central_bank_short_veto_strategies=env_str(
+            "CENTRAL_BANK_SHORT_VETO_STRATEGIES", "EXHAUSTION_REVERSAL"
+        ),
+        risk_parity_enabled=env_bool("RISK_PARITY_ENABLED", False),
+        risk_parity_rebalance_interval_days=env_int("RISK_PARITY_REBALANCE_INTERVAL_DAYS", 7),
+        risk_parity_lookback_days=env_int("RISK_PARITY_LOOKBACK_DAYS", 20),
+        risk_parity_min_weight=env_float("RISK_PARITY_MIN_WEIGHT", 0.20),
+        risk_parity_max_weight=env_float("RISK_PARITY_MAX_WEIGHT", 0.80),
+        risk_parity_rebalance_threshold=env_float("RISK_PARITY_REBALANCE_THRESHOLD", 0.05),
     )
     _validate_settings(settings)
     return settings
@@ -640,3 +700,42 @@ def _validate_settings(settings: Settings) -> None:
         raise ValueError("EXECUTION_LIMIT_SPREAD_MULTIPLIER must be >= 0")
     if settings.execution_limit_timeout_seconds < 1:
         raise ValueError("EXECUTION_LIMIT_TIMEOUT_SECONDS must be >= 1")
+    # Q2 validations
+    if settings.miners_state_max_age_hours < 0:
+        raise ValueError("MINERS_STATE_MAX_AGE_HOURS must be >= 0")
+    if settings.miners_confirm_threshold_pct <= 0:
+        raise ValueError("MINERS_CONFIRM_THRESHOLD_PCT must be > 0")
+    if settings.miners_etf_flow_threshold_pct <= 0:
+        raise ValueError("MINERS_ETF_FLOW_THRESHOLD_PCT must be > 0")
+    if settings.miners_score_offset < 0:
+        raise ValueError("MINERS_SCORE_OFFSET must be >= 0")
+    if settings.miners_long_confirm_size_mult < 1.0:
+        raise ValueError("MINERS_LONG_CONFIRM_SIZE_MULT must be >= 1.0")
+    if settings.factor_model_state_max_age_hours < 0:
+        raise ValueError("FACTOR_MODEL_STATE_MAX_AGE_HOURS must be >= 0")
+    if settings.factor_tips_weight < 0 or settings.factor_dxy_weight < 0 or settings.factor_gld_weight < 0:
+        raise ValueError("Factor-model weights must all be >= 0")
+    if (settings.factor_tips_weight + settings.factor_dxy_weight + settings.factor_gld_weight) <= 0:
+        raise ValueError("At least one factor-model weight must be > 0")
+    if not (0.0 < settings.factor_align_threshold <= 1.0):
+        raise ValueError("FACTOR_ALIGN_THRESHOLD must be in (0, 1]")
+    if settings.factor_align_size_mult < 1.0:
+        raise ValueError("FACTOR_ALIGN_SIZE_MULT must be >= 1.0")
+    if not (0.0 < settings.factor_oppose_size_mult <= 1.0):
+        raise ValueError("FACTOR_OPPOSE_SIZE_MULT must be in (0, 1]")
+    if settings.factor_score_offset < 0:
+        raise ValueError("FACTOR_SCORE_OFFSET must be >= 0")
+    if settings.central_bank_state_max_age_days < 1:
+        raise ValueError("CENTRAL_BANK_STATE_MAX_AGE_DAYS must be >= 1")
+    if settings.central_bank_high_demand_tonnes <= 0:
+        raise ValueError("CENTRAL_BANK_HIGH_DEMAND_TONNES must be > 0")
+    if settings.risk_parity_rebalance_interval_days < 1:
+        raise ValueError("RISK_PARITY_REBALANCE_INTERVAL_DAYS must be >= 1")
+    if settings.risk_parity_lookback_days < 2:
+        raise ValueError("RISK_PARITY_LOOKBACK_DAYS must be >= 2")
+    if not (0.0 < settings.risk_parity_min_weight < settings.risk_parity_max_weight <= 1.0):
+        raise ValueError(
+            "Risk-parity weights must satisfy 0 < min_weight < max_weight <= 1"
+        )
+    if not (0.0 <= settings.risk_parity_rebalance_threshold <= 0.5):
+        raise ValueError("RISK_PARITY_REBALANCE_THRESHOLD must be in [0, 0.5]")

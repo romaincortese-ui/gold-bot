@@ -36,6 +36,12 @@ from goldbot.options_iv import (
     should_gate_strategy as options_iv_should_gate_strategy,
 )
 from goldbot.regime import classify_from_settings, parse_strategy_csv, strategy_allowed_in_regime
+from goldbot.miners_overlay import apply_miners_overlay, load_miners_signal_from_macro_state
+from goldbot.factor_model import apply_factor_overlay, load_factor_signal_from_macro_state
+from goldbot.central_bank_flow import (
+    apply_central_bank_short_veto,
+    load_central_bank_flow_from_macro_state,
+)
 from goldbot.shared_backend import load_json_payload, publish_runtime_status, save_json_payload
 from goldbot.sizing import compute_risk_amount
 from goldbot.spread_tracker import SpreadTracker
@@ -323,6 +329,21 @@ class GoldBotRuntime:
             now,
             max_age_hours=self.settings.options_iv_state_max_age_hours,
         )
+        miners_signal = load_miners_signal_from_macro_state(
+            self.settings.macro_state_file,
+            now,
+            max_age_hours=self.settings.miners_state_max_age_hours,
+        )
+        factor_signal = load_factor_signal_from_macro_state(
+            self.settings.macro_state_file,
+            now,
+            max_age_hours=self.settings.factor_model_state_max_age_hours,
+        )
+        central_bank_signal = load_central_bank_flow_from_macro_state(
+            self.settings.macro_state_file,
+            now,
+            max_age_days=self.settings.central_bank_state_max_age_days,
+        )
         scored_events = load_event_scores(
             self.settings.macro_state_file,
             now=now,
@@ -410,8 +431,23 @@ class GoldBotRuntime:
             filtered = apply_real_yield_overlay(self.settings, opportunity, real_yield_signal)
             if filtered is not None:
                 filtered = apply_cftc_overlay(self.settings, filtered, cftc_signal)
+                # Q2 §4.1: miners overlay (XAU daily % feeds divergence).
+                gold_daily_change_pct = self._gold_daily_change_pct(df_h1)
+                filtered = apply_miners_overlay(
+                    self.settings,
+                    filtered,
+                    miners_signal,
+                    gold_daily_change_pct=gold_daily_change_pct,
+                )
+                # Q2 §4.2: 3-factor model (TIPS / DXY / GLD flow).
+                filtered = apply_factor_overlay(self.settings, filtered, factor_signal)
+                # Q2 §4.3: central-bank flow veto for EXHAUSTION_REVERSAL shorts.
+                filtered = apply_central_bank_short_veto(
+                    self.settings, filtered, central_bank_signal
+                )
                 # Sprint 3 §3.1: co-trade gates can still veto an opportunity.
-                filtered = apply_co_trade_gates(self.settings, filtered, co_trade_signal)
+                if filtered is not None:
+                    filtered = apply_co_trade_gates(self.settings, filtered, co_trade_signal)
                 if filtered is not None:
                     calibrated.append(filtered)
 
@@ -810,6 +846,25 @@ class GoldBotRuntime:
         if ref_close <= 0:
             return None
         return abs(latest_close - ref_close) / ref_close
+
+    @staticmethod
+    def _gold_daily_change_pct(df_h1) -> float | None:
+        """Return the last 24h signed % change on the H1 frame.
+
+        Used by the miners overlay to detect miners-vs-gold divergences.
+        Returns ``None`` when the frame is too short or the reference
+        close is non-positive.
+        """
+        if df_h1 is None or len(df_h1) < 25:
+            return None
+        try:
+            latest_close = float(df_h1.iloc[-1]["close"])
+            ref_close = float(df_h1.iloc[-25]["close"])
+        except Exception:
+            return None
+        if ref_close <= 0:
+            return None
+        return (latest_close - ref_close) / ref_close
 
     def _process_control_requests(self, state: dict) -> None:
         requests = list(state.get("control_requests", []))
