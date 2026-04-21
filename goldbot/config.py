@@ -155,6 +155,65 @@ class Settings:
     # 15-day window). Pros treat 1.2-1.5 ATR as "near" in high-vol gold.
     exhaustion_near_sr_atr_mult: float = 1.3
 
+    # --- Sprint 1 (Apr 2026): institutional-grade upgrades ---
+    # 2.2 Adaptive spread cap. Instead of rejecting every fill at a static
+    # pip-count, take median spread over a rolling window and reject fills
+    # that exceed `max(floor, median * multiplier)`. Static cap acts as an
+    # absolute upper bound to catch pathological feed errors.
+    adaptive_spread_enabled: bool = True
+    adaptive_spread_window_minutes: int = 30
+    adaptive_spread_multiplier: float = 1.8
+    adaptive_spread_floor: float = 0.25  # below this, use floor (thin markets)
+    adaptive_spread_min_samples: int = 6  # warm-up: fall back to static cap until we have this many samples
+
+    # 2.3 Real-yields absolute-level sign gate. On top of the change-bps
+    # scaling/veto, refuse LONG gold when 10Y real yield is above a hostile
+    # level AND rising, refuse SHORT gold when yield is below a friendly
+    # level AND falling. Drives most weekly gold variance historically.
+    real_yield_level_gate_enabled: bool = True
+    real_yield_long_veto_level_pct: float = 1.80   # 10Y TIPS %. Rising + above => no longs.
+    real_yield_short_veto_level_pct: float = 1.00  # 10Y TIPS %. Falling + below => no shorts.
+    real_yield_slope_lookback_days: int = 5
+    real_yield_slope_threshold_bps: float = 0.0    # bps over lookback. sign matters only.
+
+    # 2.4 Volatility-target sizing. Size so that 1 ATR at the stop distance
+    # equals `vol_target_nav_bps` basis points of account NAV. Always clamped
+    # to the pre-existing `max_risk_per_trade` cap so this never *increases*
+    # risk above the manual ceiling — it only brings down size on high-vol
+    # days when a static %-of-equity would be over-sized.
+    vol_target_sizing_enabled: bool = True
+    vol_target_nav_bps: float = 25.0  # 25 bp of NAV per 1 ATR of stop distance
+
+    # 2.5 Impulse confirmation. OANDA tick volume is the number of quotes,
+    # not traded volume, and correlates with spread widening rather than
+    # participation. Replace/augment with a body-to-ATR ratio on the breakout
+    # candle which is a cleaner proxy for a genuine directional impulse.
+    breakout_impulse_confirm_enabled: bool = True
+    breakout_impulse_body_atr_min: float = 0.40
+    breakout_impulse_require_tick_volume: bool = False  # if True, require BOTH; else EITHER passes
+
+    # 2.1 Event scoring. Keyword matches are binary; real desks score each
+    # high-impact release on surprise magnitude and cross-asset confirmation.
+    # When scoring data is available via the macro state file, only take
+    # MACRO_BREAKOUT when the composite score clears a threshold. Falls back
+    # to the legacy keyword gate (no-op) when scoring data is missing.
+    news_surprise_filter_enabled: bool = False
+    news_surprise_min_composite: float = 0.60  # 0..1 composite score
+    news_surprise_require_direction_match: bool = True  # breakout side must match sign of surprise
+    news_score_state_max_age_minutes: int = 120
+
+    # 2.8 Portfolio drawdown kill switch. Rolling-NAV guard: scales risk down
+    # on a -6% 30-day drawdown, halts new entries on a -10% 90-day drawdown
+    # and leaves the halt in place until an operator clears it manually. No
+    # auto-resume — boilerplate at any real desk.
+    drawdown_kill_switch_enabled: bool = True
+    drawdown_soft_window_days: int = 30
+    drawdown_soft_threshold_pct: float = -0.06
+    drawdown_soft_risk_per_trade: float = 0.003  # 0.30% of sleeve when soft cut active
+    drawdown_hard_window_days: int = 90
+    drawdown_hard_threshold_pct: float = -0.10
+    drawdown_equity_history_max_days: int = 180  # trim history after this
+
 
 def load_settings() -> Settings:
     settings = Settings(
@@ -245,6 +304,33 @@ def load_settings() -> Settings:
         breakout_session_open_box_hours=env_int("BREAKOUT_SESSION_OPEN_BOX_HOURS", 8),
         breakout_session_open_min_box_atr_ratio=env_float("BREAKOUT_SESSION_OPEN_MIN_BOX_ATR_RATIO", 2.75),
         exhaustion_near_sr_atr_mult=env_float("EXHAUSTION_NEAR_SR_ATR_MULT", 1.3),
+        # --- Sprint 1 knobs ---
+        adaptive_spread_enabled=env_bool("ADAPTIVE_SPREAD_ENABLED", True),
+        adaptive_spread_window_minutes=env_int("ADAPTIVE_SPREAD_WINDOW_MINUTES", 30),
+        adaptive_spread_multiplier=env_float("ADAPTIVE_SPREAD_MULTIPLIER", 1.8),
+        adaptive_spread_floor=env_float("ADAPTIVE_SPREAD_FLOOR", 0.25),
+        adaptive_spread_min_samples=env_int("ADAPTIVE_SPREAD_MIN_SAMPLES", 6),
+        real_yield_level_gate_enabled=env_bool("REAL_YIELD_LEVEL_GATE_ENABLED", True),
+        real_yield_long_veto_level_pct=env_float("REAL_YIELD_LONG_VETO_LEVEL_PCT", 1.80),
+        real_yield_short_veto_level_pct=env_float("REAL_YIELD_SHORT_VETO_LEVEL_PCT", 1.00),
+        real_yield_slope_lookback_days=env_int("REAL_YIELD_SLOPE_LOOKBACK_DAYS", 5),
+        real_yield_slope_threshold_bps=env_float("REAL_YIELD_SLOPE_THRESHOLD_BPS", 0.0),
+        vol_target_sizing_enabled=env_bool("VOL_TARGET_SIZING_ENABLED", True),
+        vol_target_nav_bps=env_float("VOL_TARGET_NAV_BPS", 25.0),
+        breakout_impulse_confirm_enabled=env_bool("BREAKOUT_IMPULSE_CONFIRM_ENABLED", True),
+        breakout_impulse_body_atr_min=env_float("BREAKOUT_IMPULSE_BODY_ATR_MIN", 0.40),
+        breakout_impulse_require_tick_volume=env_bool("BREAKOUT_IMPULSE_REQUIRE_TICK_VOLUME", False),
+        news_surprise_filter_enabled=env_bool("NEWS_SURPRISE_FILTER_ENABLED", False),
+        news_surprise_min_composite=env_float("NEWS_SURPRISE_MIN_COMPOSITE", 0.60),
+        news_surprise_require_direction_match=env_bool("NEWS_SURPRISE_REQUIRE_DIRECTION_MATCH", True),
+        news_score_state_max_age_minutes=env_int("NEWS_SCORE_STATE_MAX_AGE_MINUTES", 120),
+        drawdown_kill_switch_enabled=env_bool("DRAWDOWN_KILL_SWITCH_ENABLED", True),
+        drawdown_soft_window_days=env_int("DRAWDOWN_SOFT_WINDOW_DAYS", 30),
+        drawdown_soft_threshold_pct=env_float("DRAWDOWN_SOFT_THRESHOLD_PCT", -0.06),
+        drawdown_soft_risk_per_trade=env_float("DRAWDOWN_SOFT_RISK_PER_TRADE", 0.003),
+        drawdown_hard_window_days=env_int("DRAWDOWN_HARD_WINDOW_DAYS", 90),
+        drawdown_hard_threshold_pct=env_float("DRAWDOWN_HARD_THRESHOLD_PCT", -0.10),
+        drawdown_equity_history_max_days=env_int("DRAWDOWN_EQUITY_HISTORY_MAX_DAYS", 180),
     )
     _validate_settings(settings)
     return settings
@@ -313,3 +399,30 @@ def _validate_settings(settings: Settings) -> None:
         raise ValueError("ASIA_ACTIVE_END_UTC must be > ASIA_ACTIVE_START_UTC")
     if settings.partial_profit_rr <= 0 or settings.break_even_rr <= 0 or settings.trailing_atr_mult <= 0:
         raise ValueError("Exit-plan multipliers must be > 0")
+    # Sprint 1 validations
+    if settings.adaptive_spread_window_minutes <= 0:
+        raise ValueError("ADAPTIVE_SPREAD_WINDOW_MINUTES must be > 0")
+    if settings.adaptive_spread_multiplier <= 1.0:
+        raise ValueError("ADAPTIVE_SPREAD_MULTIPLIER must be > 1.0")
+    if settings.adaptive_spread_floor <= 0:
+        raise ValueError("ADAPTIVE_SPREAD_FLOOR must be > 0")
+    if settings.adaptive_spread_min_samples < 1:
+        raise ValueError("ADAPTIVE_SPREAD_MIN_SAMPLES must be >= 1")
+    if settings.real_yield_long_veto_level_pct <= settings.real_yield_short_veto_level_pct:
+        raise ValueError("REAL_YIELD_LONG_VETO_LEVEL_PCT must be > REAL_YIELD_SHORT_VETO_LEVEL_PCT")
+    if settings.real_yield_slope_lookback_days <= 0:
+        raise ValueError("REAL_YIELD_SLOPE_LOOKBACK_DAYS must be > 0")
+    if settings.vol_target_nav_bps <= 0:
+        raise ValueError("VOL_TARGET_NAV_BPS must be > 0")
+    if settings.breakout_impulse_body_atr_min <= 0:
+        raise ValueError("BREAKOUT_IMPULSE_BODY_ATR_MIN must be > 0")
+    if not (0.0 <= settings.news_surprise_min_composite <= 1.0):
+        raise ValueError("NEWS_SURPRISE_MIN_COMPOSITE must be in [0, 1]")
+    if settings.drawdown_soft_window_days <= 0 or settings.drawdown_hard_window_days <= 0:
+        raise ValueError("Drawdown windows must be > 0")
+    if settings.drawdown_soft_threshold_pct >= 0 or settings.drawdown_hard_threshold_pct >= 0:
+        raise ValueError("Drawdown thresholds must be negative (e.g. -0.06 for -6%)")
+    if settings.drawdown_hard_threshold_pct > settings.drawdown_soft_threshold_pct:
+        raise ValueError("Hard drawdown threshold must be <= soft drawdown threshold (more negative)")
+    if not (0 < settings.drawdown_soft_risk_per_trade <= settings.max_risk_per_trade):
+        raise ValueError("DRAWDOWN_SOFT_RISK_PER_TRADE must be > 0 and <= MAX_RISK_PER_TRADE")

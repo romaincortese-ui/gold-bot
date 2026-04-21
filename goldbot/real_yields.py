@@ -105,34 +105,63 @@ def load_real_yield_signal_from_macro_state(
 
 
 def apply_real_yield_overlay(settings: Settings, opportunity: Opportunity, signal: RealYieldSignal | None) -> Opportunity | None:
-    if not settings.real_yield_filter_enabled or signal is None or signal.real_yield_change_bps is None:
+    if not settings.real_yield_filter_enabled or signal is None:
         return opportunity
 
-    change_bps = float(signal.real_yield_change_bps)
-    veto = float(settings.real_yield_veto_bps)
-    reduce = float(settings.real_yield_reduce_risk_bps)
     metadata = dict(opportunity.metadata)
+    level = signal.real_yield_10y
+    change_bps = signal.real_yield_change_bps
+
     metadata.update(
         {
-            "real_yield_10y": round(signal.real_yield_10y, 3) if signal.real_yield_10y is not None else None,
-            "real_yield_change_bps": round(change_bps, 2),
+            "real_yield_10y": round(level, 3) if level is not None else None,
+            "real_yield_change_bps": round(change_bps, 2) if change_bps is not None else None,
             "nominal_10y": round(signal.nominal_10y, 3) if signal.nominal_10y is not None else None,
             "tips_10y": round(signal.tips_10y, 3) if signal.tips_10y is not None else None,
             "real_yield_as_of": signal.as_of.isoformat(),
-            "risk_multiplier": 1.0,
+            "risk_multiplier": float(metadata.get("risk_multiplier", 1.0) or 1.0),
         }
     )
 
-    if opportunity.direction == "LONG":
-        if change_bps >= veto:
+    # --- 2.3 Absolute-level sign gate. If 10Y real yield is rising AND at a
+    # hostile absolute level, refuse longs outright; symmetric for shorts.
+    # Real yields explain ~60% of weekly gold variance over a 20-year sample —
+    # trading against an unfavourable regime is burning edge.
+    if getattr(settings, "real_yield_level_gate_enabled", False) and level is not None and change_bps is not None:
+        slope_threshold = float(getattr(settings, "real_yield_slope_threshold_bps", 0.0))
+        long_level = float(getattr(settings, "real_yield_long_veto_level_pct", 1.80))
+        short_level = float(getattr(settings, "real_yield_short_veto_level_pct", 1.00))
+        if opportunity.direction == "LONG" and level >= long_level and change_bps > slope_threshold:
+            metadata["macro_filter"] = "real_yield_level_veto_long"
+            opportunity.metadata = metadata
             return None
-        if change_bps >= reduce:
+        if opportunity.direction == "SHORT" and level <= short_level and change_bps < -slope_threshold:
+            metadata["macro_filter"] = "real_yield_level_veto_short"
+            opportunity.metadata = metadata
+            return None
+
+    if change_bps is None:
+        opportunity.metadata = metadata
+        return opportunity
+
+    change_bps_f = float(change_bps)
+    veto = float(settings.real_yield_veto_bps)
+    reduce = float(settings.real_yield_reduce_risk_bps)
+
+    if opportunity.direction == "LONG":
+        if change_bps_f >= veto:
+            metadata["macro_filter"] = "real_yield_change_veto_long"
+            opportunity.metadata = metadata
+            return None
+        if change_bps_f >= reduce:
             metadata["risk_multiplier"] = settings.real_yield_adverse_risk_multiplier
             metadata["macro_filter"] = "real_yield_long_reduced"
     else:
-        if change_bps <= -veto:
+        if change_bps_f <= -veto:
+            metadata["macro_filter"] = "real_yield_change_veto_short"
+            opportunity.metadata = metadata
             return None
-        if change_bps <= -reduce:
+        if change_bps_f <= -reduce:
             metadata["risk_multiplier"] = settings.real_yield_adverse_risk_multiplier
             metadata["macro_filter"] = "real_yield_short_reduced"
 

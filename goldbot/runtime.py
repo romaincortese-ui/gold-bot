@@ -25,8 +25,12 @@ from goldbot.config import load_settings
 from goldbot.marketdata import OandaClient, SpreadTooWideError
 from goldbot.models import Opportunity
 from goldbot.news import fetch_calendar_events, filter_gold_events
+from goldbot.news_scoring import load_event_scores
+from goldbot.kill_switch import EquityHistory, evaluate_kill_switch, latch_halt_state
 from goldbot.real_yields import apply_real_yield_overlay, load_real_yield_signal_from_macro_state
 from goldbot.shared_backend import load_json_payload, publish_runtime_status, save_json_payload
+from goldbot.sizing import compute_risk_amount
+from goldbot.spread_tracker import SpreadTracker
 from goldbot.strategies import (
     score_exhaustion_reversal,
     score_macro_breakout,
@@ -67,6 +71,14 @@ class GoldBotRuntime:
         self.calibration_redis_key = os.getenv("GOLD_CALIBRATION_REDIS_KEY", CALIBRATION_REDIS_KEY).strip()
         self.calibration: dict | None = None
         self.telegram_client = self._build_telegram_client()
+        # Sprint 1: rolling-median spread tracker fed by every quote fetch.
+        self._spread_tracker = SpreadTracker(
+            window_minutes=self.settings.adaptive_spread_window_minutes,
+            multiplier=self.settings.adaptive_spread_multiplier,
+            floor=self.settings.adaptive_spread_floor,
+            min_samples=self.settings.adaptive_spread_min_samples,
+            static_cap=self.settings.max_entry_spread,
+        )
 
     def run_forever(self) -> None:
         bootstrap_state = self._load_state()
@@ -198,6 +210,21 @@ class GoldBotRuntime:
         state["account_margin_available"] = float(account.get("margin_available", 0.0) or 0.0)
         state["execution_mode"] = self.settings.execution_mode
 
+        # Sprint 1 (2.8): update rolling equity history and evaluate the
+        # drawdown kill switch BEFORE we decide to scan. A halted bot still
+        # manages open trades (above) but refuses to open new ones.
+        kill_decision = self._evaluate_drawdown_kill_switch(state, now)
+        if kill_decision is not None and kill_decision.halt:
+            log.warning("Drawdown kill-switch halt: %s", kill_decision.reason)
+            state.update({
+                "last_run_at": now.isoformat(),
+                "last_session": session_name,
+                "skip_reason": f"kill_switch_halt:{kill_decision.reason}",
+            })
+            self._save_state(state)
+            self._publish_runtime_status("halted", state, balance=balance)
+            return None
+
         open_gold_trades = list(state.get("open_trades", []))
         if len(open_gold_trades) >= self.settings.max_open_gold_trades:
             log.info("Skipping scan because %s open gold trade(s) already exist", len(open_gold_trades))
@@ -255,6 +282,11 @@ class GoldBotRuntime:
             now,
             max_age_hours=self.settings.real_yield_state_max_age_hours,
         )
+        scored_events = load_event_scores(
+            self.settings.macro_state_file,
+            now=now,
+            max_age_minutes=self.settings.news_score_state_max_age_minutes,
+        )
 
         self._refresh_calibration()
 
@@ -266,7 +298,17 @@ class GoldBotRuntime:
             ]
         else:
             opportunities = [
-                score_macro_breakout(self.settings, now, session_name, df_m15, df_h1, relevant_events, breakout_volume_signal, reasons=rejection_reasons),
+                score_macro_breakout(
+                    self.settings,
+                    now,
+                    session_name,
+                    df_m15,
+                    df_h1,
+                    relevant_events,
+                    breakout_volume_signal,
+                    reasons=rejection_reasons,
+                    scored_events=scored_events,
+                ),
                 score_exhaustion_reversal(self.settings, df_h4, df_d1, reasons=rejection_reasons),
                 score_trend_pullback(self.settings, df_h1, df_h4, usd_proxy_frames, reasons=rejection_reasons),
             ]
@@ -304,9 +346,43 @@ class GoldBotRuntime:
         calibration_risk_mult = float(best.metadata.get("calibration_risk_mult", 1.0) or 1.0)
         calibration_risk_mult = max(0.5, min(1.5, calibration_risk_mult))  # clamp to safe range
         risk_multiplier = float(best.metadata.get("risk_multiplier", 1.0) or 1.0) * calibration_risk_mult
-        risk_amount = min(snapshot.max_trade_risk_amount * risk_multiplier, snapshot.available_gold_risk)
+
+        # Sprint 1 (2.4): volatility-target sizing. Compute a vol-adjusted
+        # risk budget so that 1 ATR of adverse move consumes `vol_target_nav_bps`
+        # of NAV. Always clamped by the legacy %-of-sleeve cap and the
+        # portfolio-wide available budget — this only ever reduces size on
+        # high-vol days vs. fixed 0.75%-of-sleeve sizing.
+        # Sprint 1 (2.8): if the drawdown kill-switch soft-cut fired this
+        # cycle, override max_trade_risk_amount to the soft-cut fraction of
+        # the gold sleeve balance. Hard halt is already handled earlier.
+        legacy_cap = snapshot.max_trade_risk_amount
+        if kill_decision is not None and kill_decision.soft_cut and kill_decision.risk_per_trade_override is not None:
+            legacy_cap = snapshot.gold_sleeve_balance * float(kill_decision.risk_per_trade_override)
+            log.info(
+                "Drawdown soft-cut active: reducing per-trade risk to %.2f%% of sleeve (%.2f)",
+                kill_decision.risk_per_trade_override * 100,
+                legacy_cap,
+            )
+
+        nav = float(state.get("account_nav", balance) or balance)
+        atr_for_sizing = float(best.metadata.get("atr") or 0.0)
+        sizing_decision = compute_risk_amount(
+            nav=nav,
+            atr=atr_for_sizing,
+            stop_distance=best.risk_per_unit,
+            target_nav_bps=self.settings.vol_target_nav_bps,
+            legacy_max_trade_risk=legacy_cap,
+            available_gold_risk=snapshot.available_gold_risk,
+            enabled=self.settings.vol_target_sizing_enabled,
+            risk_multiplier=risk_multiplier,
+        )
+        risk_amount = sizing_decision.risk_amount
+        best.metadata["sizing_source"] = sizing_decision.source
+        best.metadata["sizing_nav"] = round(sizing_decision.nav, 2)
+        best.metadata["sizing_atr"] = round(sizing_decision.atr, 4)
+        best.metadata["sizing_target_nav_bps"] = sizing_decision.target_nav_bps
         if risk_amount <= 0:
-            log.info("No gold risk budget available")
+            log.info("No gold risk budget available (source=%s)", sizing_decision.source)
             state.update({"last_run_at": now.isoformat(), "last_session": session_name, "skip_reason": "risk_budget_exhausted"})
             self._save_state(state)
             self._publish_runtime_status("risk_budget_exhausted", state, balance=balance)
@@ -383,22 +459,57 @@ class GoldBotRuntime:
         self._publish_runtime_status("trade_opened", state, balance=balance)
         return result
 
+    def _evaluate_drawdown_kill_switch(self, state: dict, now: datetime):
+        """Maintain equity history in state and evaluate the kill switch.
+
+        Returns the DrawdownDecision (or None if disabled). The caller is
+        responsible for honouring .halt (refuse new entries) and .soft_cut
+        (scale per-trade risk). Open positions are always managed through to
+        their documented exit.
+        """
+        if not getattr(self.settings, "drawdown_kill_switch_enabled", False):
+            state.pop("kill_switch", None)
+            return None
+
+        equity = float(state.get("account_nav", state.get("account_balance", 0.0)) or 0.0)
+        history = EquityHistory(state.get("equity_history") or [])
+        history.append_today(now, equity)
+        history.trim(keep_days=int(self.settings.drawdown_equity_history_max_days), now=now)
+
+        decision = evaluate_kill_switch(
+            history=history,
+            equity_now=equity,
+            now=now,
+            latched_halt=state.get("kill_switch"),
+            soft_window_days=int(self.settings.drawdown_soft_window_days),
+            soft_threshold_pct=float(self.settings.drawdown_soft_threshold_pct),
+            soft_risk_per_trade=float(self.settings.drawdown_soft_risk_per_trade),
+            hard_window_days=int(self.settings.drawdown_hard_window_days),
+            hard_threshold_pct=float(self.settings.drawdown_hard_threshold_pct),
+        )
+
+        state["equity_history"] = history.to_list()
+        state["kill_switch"] = latch_halt_state(state.get("kill_switch"), decision, now=now)
+        return decision
+
     def _await_entry_quote(self, opportunity: Opportunity) -> dict[str, float]:
         quote = self.client.get_price(self.settings.instrument)
+        self._record_spread_sample(quote)
         if opportunity.strategy != "MACRO_BREAKOUT" or self.settings.execution_mode != "live":
-            self.client.validate_entry_spread(quote)
+            self._validate_spread_adaptive(quote)
             return quote
 
         settle_seconds = self.settings.macro_breakout_spread_settle_seconds
         if settle_seconds <= 0:
-            self.client.validate_entry_spread(quote)
+            self._validate_spread_adaptive(quote)
             return quote
 
         stable_spreads: list[float] = []
         deadline = time.monotonic() + settle_seconds
         while True:
             spread = float(quote.get("spread", 0.0) or 0.0)
-            if spread <= self.settings.max_entry_spread:
+            allowed = self._current_allowed_spread()
+            if spread <= allowed:
                 stable_spreads.append(spread)
                 stable_spreads = stable_spreads[-self.settings.macro_breakout_spread_stability_checks :]
                 if len(stable_spreads) == self.settings.macro_breakout_spread_stability_checks:
@@ -410,10 +521,38 @@ class GoldBotRuntime:
 
             if time.monotonic() >= deadline:
                 raise SpreadTooWideError(
-                    f"Spread did not stabilize within {settle_seconds}s; last spread {spread:.3f}"
+                    f"Spread did not stabilize within {settle_seconds}s; last spread {spread:.3f} > allowed {allowed:.3f}"
                 )
             time.sleep(1.0)
             quote = self.client.get_price(self.settings.instrument)
+            self._record_spread_sample(quote)
+
+    def _record_spread_sample(self, quote: dict[str, float]) -> None:
+        if not getattr(self.settings, "adaptive_spread_enabled", False):
+            return
+        spread = quote.get("spread")
+        if spread is None:
+            return
+        try:
+            self._spread_tracker.record(float(spread))
+        except (TypeError, ValueError):
+            return
+
+    def _current_allowed_spread(self) -> float:
+        if not getattr(self.settings, "adaptive_spread_enabled", False):
+            return float(self.settings.max_entry_spread)
+        return float(self._spread_tracker.allowed_spread())
+
+    def _validate_spread_adaptive(self, quote: dict[str, float]) -> None:
+        if not getattr(self.settings, "adaptive_spread_enabled", False):
+            self.client.validate_entry_spread(quote)
+            return
+        spread = float(quote.get("spread", 0.0) or 0.0)
+        allowed = self._current_allowed_spread()
+        if spread > allowed + 1e-9:
+            raise SpreadTooWideError(
+                f"Spread {spread:.3f} exceeds adaptive max {allowed:.3f} (median={self._spread_tracker.median() or 0.0:.3f}, samples={self._spread_tracker.sample_count()})"
+            )
 
     def _build_trade_record(self, opportunity: Opportunity, result: dict, size: float, risk_amount: float, opened_at: datetime) -> dict:
         return {

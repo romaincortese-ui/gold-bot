@@ -18,7 +18,9 @@ from goldbot.indicators import (
     nearest_support_resistance,
 )
 from goldbot.models import CalendarEvent, Opportunity
+from goldbot.news_scoring import EventScore, select_best_for_breakout
 from goldbot.volume_oracle import BreakoutVolumeSignal
+from goldbot.impulse import body_atr_ratio, confirms_breakout
 
 
 USD_PROXY_COMPONENTS: tuple[tuple[str, float], ...] = (
@@ -42,6 +44,7 @@ def score_macro_breakout(
     events: list[CalendarEvent],
     breakout_volume_signal: BreakoutVolumeSignal | None = None,
     reasons: list[str] | None = None,
+    scored_events: list[EventScore] | None = None,
 ) -> Opportunity | None:
     strategy = "MACRO_BREAKOUT"
     if df_m15 is None or df_h1 is None or len(df_m15) < 40 or len(df_h1) < settings.breakout_box_hours + 8:
@@ -142,10 +145,50 @@ def score_macro_breakout(
     breakout_volume = float(df_m15["volume"].iloc[-1])
     avg_volume = float(df_m15["volume"].iloc[-21:-1].mean()) if len(df_m15) >= 21 else breakout_volume
     volume_ratio = breakout_volume / avg_volume if avg_volume > 0 else 1.0
-    volume_confirmation = _confirm_breakout_volume(settings, volume_ratio, breakout_volume_signal)
-    if volume_confirmation is None:
-        _reject(reasons, strategy, f"volume_ratio={volume_ratio:.2f}<{settings.breakout_min_volume_ratio}")
-        return None
+    tick_confirmation = _confirm_breakout_volume(settings, volume_ratio, breakout_volume_signal)
+
+    # 2.5: impulse confirmation (body/ATR) replaces OANDA tick-volume as the
+    # primary sanity check. OANDA tick volume is the number of quote updates,
+    # not traded contracts — it correlates with spread widening rather than
+    # participation and is a fake feature. A body >= 0.40 * ATR identifies a
+    # genuine directional impulse regardless of how many quotes printed.
+    impulse_enabled = bool(getattr(settings, "breakout_impulse_confirm_enabled", False))
+    require_both = bool(getattr(settings, "breakout_impulse_require_tick_volume", False))
+    impulse_body_min = float(getattr(settings, "breakout_impulse_body_atr_min", 0.40))
+    impulse_signal = body_atr_ratio(df_m15, calc_atr(df_m15, settings.atr_period)) if impulse_enabled else None
+
+    if impulse_enabled:
+        # Direction of the breakout candle must match the direction we'll
+        # ultimately trade — the caller checks last_close vs box later, but
+        # we gate here on the candle direction too. If body/ATR + tick
+        # volume disagree we fail the weaker of the two tests.
+        impulse_up_ok = confirms_breakout(impulse_signal, required_direction="UP", body_atr_min=impulse_body_min) if impulse_signal else False
+        impulse_down_ok = confirms_breakout(impulse_signal, required_direction="DOWN", body_atr_min=impulse_body_min) if impulse_signal else False
+        impulse_ok_any = impulse_up_ok or impulse_down_ok
+        if require_both:
+            # AND semantics: need BOTH impulse and tick volume
+            if tick_confirmation is None or not impulse_ok_any:
+                _reject(reasons, strategy, f"impulse_or_volume_insufficient(body_atr={impulse_signal.body_atr_ratio:.2f},vol_ratio={volume_ratio:.2f})")
+                return None
+            volume_confirmation = dict(tick_confirmation)
+        else:
+            # OR semantics: impulse alone is enough; tick volume alone is too
+            if not impulse_ok_any and tick_confirmation is None:
+                _reject(reasons, strategy, f"impulse_and_volume_both_failed(body_atr={impulse_signal.body_atr_ratio:.2f},vol_ratio={volume_ratio:.2f})")
+                return None
+            volume_confirmation = dict(tick_confirmation) if tick_confirmation is not None else {
+                "tick_volume_ratio": round(volume_ratio, 2),
+                "external_volume_ratio": None,
+                "volume_confirmation": "impulse_only",
+                "external_volume_source": None,
+            }
+        volume_confirmation["body_atr_ratio"] = round(impulse_signal.body_atr_ratio, 2)
+        volume_confirmation["impulse_direction"] = impulse_signal.direction
+    else:
+        if tick_confirmation is None:
+            _reject(reasons, strategy, f"volume_ratio={volume_ratio:.2f}<{settings.breakout_min_volume_ratio}")
+            return None
+        volume_confirmation = dict(tick_confirmation)
 
     event_label = latest_event.title if latest_event is not None else ("SESSION_OPEN" if session_open_mode else "")
     rationale_prefix = (
@@ -171,6 +214,11 @@ def score_macro_breakout(
         if session_open_mode and trend_direction_hint == "SHORT":
             _reject(reasons, strategy, "long_break_against_h1_trend")
             return None
+        news_score_meta = _apply_news_surprise_gate(
+            settings, "LONG", scored_events, session_open_mode, reasons
+        )
+        if news_score_meta is None:
+            return None
         stop_price = box["low"] - buffer_size
         risk = last_close - stop_price
         score = 70 + min(20, ((last_close - box["high"]) / max(atr, 1e-9)) * 10)
@@ -192,12 +240,18 @@ def score_macro_breakout(
                 "atr": atr,
                 "volume_ratio": round(volume_ratio, 2),
                 **volume_confirmation,
+                **news_score_meta,
             },
             exit_plan=_build_exit_plan(settings, "LONG", last_close, risk, atr, timeframe="M15"),
         )
     if last_close < box["low"] - buffer_size and float(recent_closes.max()) < box["low"]:
         if session_open_mode and trend_direction_hint == "LONG":
             _reject(reasons, strategy, "short_break_against_h1_trend")
+            return None
+        news_score_meta = _apply_news_surprise_gate(
+            settings, "SHORT", scored_events, session_open_mode, reasons
+        )
+        if news_score_meta is None:
             return None
         stop_price = box["high"] + buffer_size
         risk = stop_price - last_close
@@ -225,11 +279,64 @@ def score_macro_breakout(
                 "atr": atr,
                 "volume_ratio": round(volume_ratio, 2),
                 **volume_confirmation,
+                **news_score_meta,
             },
             exit_plan=_build_exit_plan(settings, "SHORT", last_close, risk, atr, timeframe="M15"),
         )
     _reject(reasons, "MACRO_BREAKOUT", "no_breakout_direction")
     return None
+
+
+def _apply_news_surprise_gate(
+    settings: Settings,
+    direction: str,
+    scored_events: list[EventScore] | None,
+    session_open_mode: bool,
+    reasons: list[str] | None,
+) -> dict | None:
+    """Return metadata dict on pass, or None on veto.
+
+    The gate only applies when `news_surprise_filter_enabled = True` AND we
+    have a scored event for the relevant direction. Session-open breakouts
+    (no scheduled news) are exempt — they're a different strategy archetype.
+    """
+    if not getattr(settings, "news_surprise_filter_enabled", False):
+        return {}
+    if session_open_mode:
+        return {}
+    scored_events = scored_events or []
+    if not scored_events:
+        # Filter enabled but no scored data available -> fail-safe: reject.
+        # Operator can either turn the filter off or ensure macro_engine
+        # populates `event_scores` in the macro state file.
+        _reject(reasons, "MACRO_BREAKOUT", "news_surprise_filter_enabled_but_no_scored_events")
+        return None
+    best = select_best_for_breakout(scored_events, direction=direction)
+    if best is None:
+        _reject(reasons, "MACRO_BREAKOUT", f"no_scored_event_supports_{direction}")
+        return None
+    min_composite = float(getattr(settings, "news_surprise_min_composite", 0.60))
+    require_match = bool(getattr(settings, "news_surprise_require_direction_match", True))
+    if best.composite is None:
+        _reject(reasons, "MACRO_BREAKOUT", "scored_event_composite_none")
+        return None
+    if best.composite < min_composite:
+        _reject(reasons, "MACRO_BREAKOUT", f"scored_event_composite={best.composite:.2f}<{min_composite:.2f}")
+        return None
+    if require_match:
+        # Direction must match the sign of the surprise (i.e. dovish surprise
+        # -> LONG gold; hawkish -> SHORT gold). select_best_for_breakout
+        # already filters by usd_direction, so we just confirm here.
+        if best.usd_direction not in {"UP", "DOWN"} and best.surprise_z is None:
+            _reject(reasons, "MACRO_BREAKOUT", "scored_event_direction_unknown")
+            return None
+    return {
+        "news_score_event_key": best.event_key,
+        "news_score_composite": round(best.composite, 3),
+        "news_score_surprise_z": round(best.surprise_z, 2) if best.surprise_z is not None else None,
+        "news_score_rates_bps": round(best.rates_move_bps, 2) if best.rates_move_bps is not None else None,
+        "news_score_dxy_pct": round(best.dxy_move_pct, 3) if best.dxy_move_pct is not None else None,
+    }
 
 
 def _confirm_breakout_volume(

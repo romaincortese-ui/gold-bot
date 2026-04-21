@@ -253,6 +253,11 @@ def test_run_cycle_scales_risk_when_real_yields_are_adverse(tmp_path, monkeypatc
             "real_yield_filter_enabled": True,
             "macro_state_file": str(tmp_path / "macro.json"),
             "execution_mode": "paper",
+            # Keep legacy risk-sizing math stable for this regression check.
+            "vol_target_sizing_enabled": False,
+            # Level gate is a *separate* Sprint 1 behaviour; exercise the
+            # change-bps scaling branch only by staying below the veto level.
+            "real_yield_level_gate_enabled": False,
         }
     )
     runtime.client.settings = runtime.settings
@@ -263,8 +268,8 @@ def test_run_cycle_scales_risk_when_real_yields_are_adverse(tmp_path, monkeypatc
                 "real_yields": {
                     "as_of": recent_as_of,
                     "nominal_10y": 4.2,
-                    "tips_10y": 2.1,
-                    "real_yield_10y": 2.1,
+                    "tips_10y": 1.5,
+                    "real_yield_10y": 1.5,
                     "real_yield_change_bps": 10.0,
                 }
             }
