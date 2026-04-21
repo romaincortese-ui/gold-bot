@@ -66,6 +66,8 @@ def test_build_calibration_blocks_underperformer():
         report,
         window_start=datetime(2026, 1, 1, tzinfo=timezone.utc),
         window_end=datetime(2026, 4, 1, tzinfo=timezone.utc),
+        min_trades_for_adjustment=10,
+        min_trades_for_block=20,
     )
     adj = calibration["strategy_adjustments"]["EXHAUSTION_REVERSAL"]
     assert adj["block_reason"] is not None

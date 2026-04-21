@@ -28,9 +28,16 @@ from goldbot.news import fetch_calendar_events, filter_gold_events
 from goldbot.news_scoring import load_event_scores
 from goldbot.kill_switch import EquityHistory, evaluate_kill_switch, latch_halt_state
 from goldbot.real_yields import apply_real_yield_overlay, load_real_yield_signal_from_macro_state
+from goldbot.cftc import apply_cftc_overlay, load_cftc_signal_from_macro_state
 from goldbot.shared_backend import load_json_payload, publish_runtime_status, save_json_payload
 from goldbot.sizing import compute_risk_amount
 from goldbot.spread_tracker import SpreadTracker
+from goldbot.weekend_guard import (
+    WeekendDecision,
+    decision_to_metadata,
+    evaluate_weekend,
+    widened_stop_price,
+)
 from goldbot.strategies import (
     score_exhaustion_reversal,
     score_macro_breakout,
@@ -177,6 +184,7 @@ class GoldBotRuntime:
         self._process_control_requests(state)
         self._prune_cooldowns(state, now)
         self._manage_open_trades(state)
+        weekend_decision = self._apply_weekend_management(state, now)
 
         if state.get("paused", False):
             log.info("Gold-bot is paused; managing open trades only")
@@ -233,6 +241,17 @@ class GoldBotRuntime:
             self._publish_runtime_status("active_trade", state, balance=balance)
             return None
 
+        if weekend_decision is not None and weekend_decision.block_new_entries:
+            log.info("Skipping scan: weekend gap guard (%s)", weekend_decision.reason)
+            state.update({
+                "last_run_at": now.isoformat(),
+                "last_session": session_name,
+                "skip_reason": f"weekend_guard:{weekend_decision.reason}",
+            })
+            self._save_state(state)
+            self._publish_runtime_status("idle", state, balance=balance)
+            return None
+
         events = fetch_calendar_events(self.settings.news_urls, self.settings.news_cache_file)
         relevant_events = filter_gold_events(
             events,
@@ -282,6 +301,11 @@ class GoldBotRuntime:
             now,
             max_age_hours=self.settings.real_yield_state_max_age_hours,
         )
+        cftc_signal = load_cftc_signal_from_macro_state(
+            self.settings.macro_state_file,
+            now,
+            max_age_days=self.settings.cftc_state_max_age_days,
+        )
         scored_events = load_event_scores(
             self.settings.macro_state_file,
             now=now,
@@ -325,6 +349,7 @@ class GoldBotRuntime:
             opportunity.metadata["calibration_risk_mult"] = float(adj.get("risk_mult", 1.0))
             filtered = apply_real_yield_overlay(self.settings, opportunity, real_yield_signal)
             if filtered is not None:
+                filtered = apply_cftc_overlay(self.settings, filtered, cftc_signal)
                 calibrated.append(filtered)
 
         best = select_best_opportunity(calibrated)
@@ -598,6 +623,82 @@ class GoldBotRuntime:
 
         state["open_trades"] = managed
         self._save_state(state)
+
+    def _apply_weekend_management(self, state: dict, now: datetime) -> WeekendDecision | None:
+        """Evaluate the weekend guard and act on open trades.
+
+        Returns the resolved :class:`WeekendDecision` so the caller can use
+        ``decision.block_new_entries`` to short-circuit scanning. ``None`` is
+        returned when the feature is fully disabled by config so callers can
+        treat that as a clean "do nothing".
+        """
+        if not getattr(self.settings, "weekend_gap_handling_enabled", False):
+            return None
+        decision = evaluate_weekend(
+            now,
+            enabled=True,
+            flatten_weekday=self.settings.weekend_flatten_weekday,
+            flatten_hour_utc=self.settings.weekend_flatten_hour_utc,
+            stop_widen_enabled=self.settings.weekend_stop_widen_enabled,
+            stop_widen_hour_utc=self.settings.weekend_stop_widen_hour_utc,
+            block_new_entries_hour_utc=self.settings.weekend_block_new_entries_hour_utc,
+        )
+        state["weekend_guard"] = decision_to_metadata(decision)
+
+        open_trades = list(state.get("open_trades", []))
+        if not open_trades:
+            return decision
+
+        if decision.flatten:
+            remaining: list[dict] = []
+            for trade in open_trades:
+                trade_id = str(trade.get("id", "") or "")
+                if self.client.close_trade(trade_id):
+                    self._record_event(state, "weekend_flatten", f"Trade {trade_id} closed by weekend guard ({decision.reason})", now=now)
+                    self.budget.release_gold_risk(trade_id)
+                else:
+                    remaining.append(trade)
+            state["open_trades"] = remaining
+            self._save_state(state)
+            return decision
+
+        if decision.widen_stops:
+            atr_value = self._latest_atr_estimate(timeframe="H1")
+            if atr_value is None or atr_value <= 0:
+                return decision
+            for trade in open_trades:
+                try:
+                    new_stop = widened_stop_price(
+                        direction=str(trade.get("direction", "")),
+                        entry_price=float(trade.get("entry_price", 0.0) or 0.0),
+                        current_stop=float(trade.get("stop_price", 0.0) or 0.0),
+                        atr=float(atr_value),
+                        atr_mult=self.settings.weekend_stop_widen_atr_mult,
+                        max_weekend_gap_pct=0.012,
+                    )
+                except (TypeError, ValueError):
+                    continue
+                current = float(trade.get("stop_price", 0.0) or 0.0)
+                if abs(new_stop - current) < 1e-6:
+                    continue
+                if self.client.modify_trade(str(trade["id"]), stop_price=new_stop):
+                    trade["stop_price"] = round(new_stop, 3)
+                    self._record_event(state, "weekend_widen", f"Trade {trade['id']} stop widened to {trade['stop_price']} ({decision.reason})", now=now)
+            state["open_trades"] = open_trades
+            self._save_state(state)
+
+        return decision
+
+    def _latest_atr_estimate(self, *, timeframe: str = "H1") -> float | None:
+        """Best-effort ATR fetch used by ancillary modules (weekend guard)."""
+        try:
+            candles = self.client.fetch_candles(self.settings.instrument, timeframe, 60)
+            if candles is None or len(candles) < self.settings.atr_period + 1:
+                return None
+            return float(calc_atr(candles, self.settings.atr_period))
+        except Exception:
+            log.exception("ATR estimate fetch failed")
+            return None
 
     def _process_control_requests(self, state: dict) -> None:
         requests = list(state.get("control_requests", []))

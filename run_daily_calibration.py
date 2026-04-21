@@ -76,6 +76,12 @@ def main() -> None:
         report,
         window_start=config.start,
         window_end=config.end,
+        min_trades_for_adjustment=settings.calibration_min_trades_for_adjustment,
+        min_trades_for_block=settings.calibration_min_trades_for_block,
+        shrinkage_denominator=settings.calibration_shrinkage_denominator,
+        block_pf_threshold=settings.calibration_block_pf_threshold,
+        block_expectancy_threshold=settings.calibration_block_expectancy_threshold,
+        block_win_rate_threshold=settings.calibration_block_win_rate_threshold,
     )
 
     file_path = os.getenv("GOLD_CALIBRATION_FILE", CALIBRATION_FILE).strip()

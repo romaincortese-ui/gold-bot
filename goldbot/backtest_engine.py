@@ -8,6 +8,15 @@ import pandas as pd
 
 from goldbot.backtest_config import GoldBacktestConfig
 from goldbot.backtest_data import GoldHistoricalDataProvider
+from goldbot.backtest_microstructure import (
+    SpreadModel,
+    exit_slippage_cost,
+    financing_charge,
+    hours_between,
+    is_weekend_gap_boundary,
+    parse_event_times,
+    weekend_gap_adjusted_stop,
+)
 from goldbot.config import Settings
 from goldbot.indicators import calc_atr, calc_ema
 from goldbot.marketdata import OandaClient
@@ -30,6 +39,15 @@ class GoldBacktestEngine:
         self.config = config
         self.provider = provider
         self.client = OandaClient(settings)
+        self._spread_model: SpreadModel | None = (
+            SpreadModel(
+                base_spread=float(self.config.simulated_spread),
+                news_window_minutes=int(getattr(self.settings, "backtest_spread_news_window_minutes", 2)),
+                news_multiplier=float(getattr(self.settings, "backtest_spread_news_multiplier", 6.0)),
+            )
+            if getattr(self.settings, "backtest_spread_model_enabled", False)
+            else None
+        )
 
     def run(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         frames = self.provider.load_frames(self.config, self.settings.instrument)
@@ -46,8 +64,32 @@ class GoldBacktestEngine:
         open_trade: dict[str, Any] | None = None
         cooldowns: dict[tuple[str, str], datetime] = {}
         last_checkpoint = frames["M15"]["time"].iloc[0]
+        previous_h1_timestamp: datetime | None = None
 
         for timestamp in h1_times:
+            # 3.4: weekend gap. If a trade is still open across the Friday→Monday
+            # boundary and the Monday open gaps through the stop, fill at the
+            # gap-open price (not the stop price). Symmetric for shorts.
+            if (
+                open_trade is not None
+                and getattr(self.settings, "backtest_weekend_gap_enabled", False)
+                and previous_h1_timestamp is not None
+                and is_weekend_gap_boundary(previous_h1_timestamp, timestamp)
+            ):
+                first_bar = self._first_m15_after(frames["M15"], previous_h1_timestamp, timestamp)
+                if first_bar is not None:
+                    monday_open = float(first_bar["open"])
+                    stopped, fill_price = weekend_gap_adjusted_stop(
+                        direction=str(open_trade["direction"]),
+                        stop_price=float(open_trade["stop_price"]),
+                        monday_open_price=monday_open,
+                        weekend_was_crossed=True,
+                    )
+                    if stopped:
+                        closed = self._close_trade(open_trade, exit_price=fill_price, exit_time=first_bar["time"], reason="WEEKEND_GAP_STOP")
+                        trades.append(closed)
+                        balance += float(closed["pnl"])
+                        open_trade = None
             m15_window = frames["M15"][(frames["M15"]["time"] > last_checkpoint) & (frames["M15"]["time"] <= timestamp)]
             for _, bar in m15_window.iterrows():
                 if open_trade is not None:
@@ -60,6 +102,7 @@ class GoldBacktestEngine:
                 mark_price = float(bar["close"])
                 equity_curve.append({"time": bar["time"].isoformat(), "equity": round(balance + self._unrealized_pnl(open_trade, mark_price), 4)})
             last_checkpoint = timestamp
+            previous_h1_timestamp = timestamp
 
             if open_trade is not None:
                 continue
@@ -80,7 +123,7 @@ class GoldBacktestEngine:
             if size <= 0:
                 continue
 
-            entry_price = self._entry_price(opportunity)
+            entry_price = self._entry_price(opportunity, now=timestamp, events=events)
             open_trade = {
                 "instrument": self.settings.instrument,
                 "strategy": opportunity.strategy,
@@ -88,6 +131,7 @@ class GoldBacktestEngine:
                 "entry_signal": opportunity.strategy,
                 "entry_time": timestamp.isoformat(),
                 "entry_price": entry_price,
+                "entry_spread": self._effective_spread(now=timestamp, events=events),
                 "stop_price": float(opportunity.stop_price),
                 "initial_stop_price": float(opportunity.stop_price),
                 "initial_risk_per_unit": float(opportunity.risk_per_unit),
@@ -260,6 +304,31 @@ class GoldBacktestEngine:
     def _close_trade(self, trade: dict[str, Any], *, exit_price: float, exit_time: datetime, reason: str) -> dict[str, Any]:
         remaining_pnl = self._price_pnl(trade["direction"], float(trade["entry_price"]), exit_price, float(trade["remaining_size"]))
         pnl = float(trade.get("realized_partial_pnl", 0.0)) + remaining_pnl
+
+        # 3.4 microstructure costs ------------------------------------------
+        slippage_cost = 0.0
+        financing_cost = 0.0
+        if reason in {"STOP_LOSS", "WEEKEND_GAP_STOP"} and getattr(self.settings, "backtest_spread_model_enabled", False):
+            half_spread = float(trade.get("entry_spread", self.config.simulated_spread)) / 2.0
+            slip = exit_slippage_cost(
+                half_spread=half_spread,
+                slippage_multiplier=float(getattr(self.settings, "backtest_exit_slippage_multiplier", 1.5)),
+            )
+            slippage_cost = slip * float(trade.get("remaining_size", 0.0))
+            pnl -= slippage_cost
+        if getattr(self.settings, "backtest_financing_enabled", False):
+            entry_time = self._parse_iso(trade.get("entry_time"))
+            hours_held = hours_between(entry_time, exit_time) if entry_time is not None else 0.0
+            notional = float(trade["entry_price"]) * float(trade["size"])
+            financing_cost = financing_charge(
+                direction=str(trade["direction"]),
+                notional=notional,
+                hours_held=hours_held,
+                long_apr=float(getattr(self.settings, "backtest_financing_long_apr", 0.05)),
+                short_apr=float(getattr(self.settings, "backtest_financing_short_apr", 0.0)),
+            )
+            pnl -= financing_cost
+
         risk_amount = max(float(trade.get("risk_amount", 0.0)), 1e-9)
         return {
             "instrument": trade["instrument"],
@@ -277,7 +346,28 @@ class GoldBacktestEngine:
             "pnl": round(pnl, 4),
             "pnl_pct": round((pnl / risk_amount) * 100.0, 4),
             "exit_reason": reason,
+            "slippage_cost": round(slippage_cost, 4),
+            "financing_cost": round(financing_cost, 4),
         }
+
+    @staticmethod
+    def _parse_iso(text: object) -> datetime | None:
+        if isinstance(text, datetime):
+            return text if text.tzinfo else text.replace(tzinfo=timezone.utc)
+        if not isinstance(text, str) or not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _first_m15_after(m15: pd.DataFrame, prev_ts: datetime, current_ts: datetime) -> pd.Series | None:
+        window = m15[(m15["time"] > prev_ts) & (m15["time"] <= current_ts)]
+        if window.empty:
+            return None
+        return window.iloc[0]
 
     def _is_cooldown_active(self, cooldowns: dict[tuple[str, str], datetime], opportunity: Opportunity, now: datetime) -> bool:
         key = (opportunity.strategy, opportunity.direction)
@@ -295,11 +385,18 @@ class GoldBacktestEngine:
             return
         cooldowns[(str(trade["strategy"]), str(trade["direction"]))] = exit_time.astimezone(timezone.utc) + timedelta(hours=hours)
 
-    def _entry_price(self, opportunity: Opportunity) -> float:
-        half_spread = self.config.simulated_spread / 2.0
+    def _entry_price(self, opportunity: Opportunity, *, now: datetime | None = None, events: list[CalendarEvent] | None = None) -> float:
+        spread = self._effective_spread(now=now, events=events)
+        half_spread = spread / 2.0
         if opportunity.direction == "LONG":
             return round(float(opportunity.entry_price) + half_spread, 3)
         return round(float(opportunity.entry_price) - half_spread, 3)
+
+    def _effective_spread(self, *, now: datetime | None, events: list[CalendarEvent] | None) -> float:
+        if self._spread_model is None or now is None:
+            return float(self.config.simulated_spread)
+        event_times = parse_event_times(events or [])
+        return self._spread_model.effective_spread(now, event_times)
 
     def _unrealized_pnl(self, trade: dict[str, Any] | None, mark_price: float) -> float:
         if trade is None:

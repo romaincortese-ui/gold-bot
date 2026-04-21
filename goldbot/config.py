@@ -214,6 +214,55 @@ class Settings:
     drawdown_hard_threshold_pct: float = -0.10
     drawdown_equity_history_max_days: int = 180  # trim history after this
 
+    # --- Sprint 2 (Apr 2026): weekend / calibration / CFTC hardening ---
+    # 2.6 Weekend gap handling. Gold has frequent Sunday-open gaps of
+    # 0.3-1.2%. Flatten all open trades before Friday close and widen stops
+    # through the last trading hour so a Friday stop-run cannot trigger a
+    # Monday-gap fill at a far worse price.
+    weekend_gap_handling_enabled: bool = True
+    weekend_flatten_hour_utc: int = 20           # Friday hour-of-day at which to flatten
+    weekend_flatten_weekday: int = 4             # 0=Mon, 4=Fri
+    weekend_stop_widen_enabled: bool = True
+    weekend_stop_widen_hour_utc: int = 19        # Friday hour to start widening
+    weekend_stop_widen_atr_mult: float = 2.0     # extra ATR multiples added to the stop
+    weekend_block_new_entries_hour_utc: int = 19 # Friday hour to stop opening new trades
+
+    # 2.7 Calibration hardening. The original 2-trade activation is way
+    # below statistical significance. Raise the minimum sample and apply a
+    # James-Stein-style shrinkage so adjustments asymptote to neutral until
+    # we have a meaningful sample. Hard-block also needs more evidence.
+    calibration_min_trades_for_adjustment: int = 40
+    calibration_min_trades_for_block: int = 80
+    calibration_shrinkage_denominator: int = 200  # shrink = min(1, n/denom)
+    calibration_block_pf_threshold: float = 0.7
+    calibration_block_expectancy_threshold: float = -5.0
+    calibration_block_win_rate_threshold: float = 0.35
+
+    # 3.4 Realistic backtest microstructure. The default simulated_spread=0.25
+    # is a flat pip figure; in reality gold spreads double through Tokyo and
+    # 6x through the NFP minute. The weekend gap is not simulated. Overnight
+    # financing on longs is ~5% APR, on shorts ~0%. These feed into the
+    # backtest engine only; live execution is unaffected.
+    backtest_spread_model_enabled: bool = True
+    backtest_spread_profile: str = "gold_m15"    # name of the hour-of-day profile
+    backtest_spread_news_window_minutes: int = 2
+    backtest_spread_news_multiplier: float = 6.0
+    backtest_exit_slippage_multiplier: float = 1.5  # adverse selection on stops
+    backtest_weekend_gap_enabled: bool = True
+    backtest_weekend_flatten_hour_utc: int = 20
+    backtest_financing_enabled: bool = True
+    backtest_financing_long_apr: float = 0.05    # 5% APR cost on long XAU
+    backtest_financing_short_apr: float = 0.0    # flat on shorts
+
+    # 3.5 CFTC positioning filter. Weekly Commitment of Traders report for
+    # gold futures (CME GC). Managed-money extreme net long -> fade further
+    # long entries; extreme net short -> fade further short entries. Only
+    # applies a score offset (~+/- 8 points), never a hard block.
+    cftc_filter_enabled: bool = False
+    cftc_state_max_age_days: int = 10            # stale if > 10d (report is weekly)
+    cftc_extreme_percentile: float = 0.85        # 85th pctile triggers fade
+    cftc_extreme_score_offset: float = 8.0       # +/- score offset applied to crowded side
+
 
 def load_settings() -> Settings:
     settings = Settings(
@@ -331,6 +380,34 @@ def load_settings() -> Settings:
         drawdown_hard_window_days=env_int("DRAWDOWN_HARD_WINDOW_DAYS", 90),
         drawdown_hard_threshold_pct=env_float("DRAWDOWN_HARD_THRESHOLD_PCT", -0.10),
         drawdown_equity_history_max_days=env_int("DRAWDOWN_EQUITY_HISTORY_MAX_DAYS", 180),
+        # Sprint 2: weekend / calibration / backtest microstructure / CFTC
+        weekend_gap_handling_enabled=env_bool("WEEKEND_GAP_HANDLING_ENABLED", True),
+        weekend_flatten_hour_utc=env_int("WEEKEND_FLATTEN_HOUR_UTC", 20),
+        weekend_flatten_weekday=env_int("WEEKEND_FLATTEN_WEEKDAY", 4),
+        weekend_stop_widen_enabled=env_bool("WEEKEND_STOP_WIDEN_ENABLED", True),
+        weekend_stop_widen_hour_utc=env_int("WEEKEND_STOP_WIDEN_HOUR_UTC", 19),
+        weekend_stop_widen_atr_mult=env_float("WEEKEND_STOP_WIDEN_ATR_MULT", 2.0),
+        weekend_block_new_entries_hour_utc=env_int("WEEKEND_BLOCK_NEW_ENTRIES_HOUR_UTC", 19),
+        calibration_min_trades_for_adjustment=env_int("CALIBRATION_MIN_TRADES_FOR_ADJUSTMENT", 40),
+        calibration_min_trades_for_block=env_int("CALIBRATION_MIN_TRADES_FOR_BLOCK", 80),
+        calibration_shrinkage_denominator=env_int("CALIBRATION_SHRINKAGE_DENOMINATOR", 200),
+        calibration_block_pf_threshold=env_float("CALIBRATION_BLOCK_PF_THRESHOLD", 0.7),
+        calibration_block_expectancy_threshold=env_float("CALIBRATION_BLOCK_EXPECTANCY_THRESHOLD", -5.0),
+        calibration_block_win_rate_threshold=env_float("CALIBRATION_BLOCK_WIN_RATE_THRESHOLD", 0.35),
+        backtest_spread_model_enabled=env_bool("BACKTEST_SPREAD_MODEL_ENABLED", True),
+        backtest_spread_profile=env_str("BACKTEST_SPREAD_PROFILE", "gold_m15"),
+        backtest_spread_news_window_minutes=env_int("BACKTEST_SPREAD_NEWS_WINDOW_MINUTES", 2),
+        backtest_spread_news_multiplier=env_float("BACKTEST_SPREAD_NEWS_MULTIPLIER", 6.0),
+        backtest_exit_slippage_multiplier=env_float("BACKTEST_EXIT_SLIPPAGE_MULTIPLIER", 1.5),
+        backtest_weekend_gap_enabled=env_bool("BACKTEST_WEEKEND_GAP_ENABLED", True),
+        backtest_weekend_flatten_hour_utc=env_int("BACKTEST_WEEKEND_FLATTEN_HOUR_UTC", 20),
+        backtest_financing_enabled=env_bool("BACKTEST_FINANCING_ENABLED", True),
+        backtest_financing_long_apr=env_float("BACKTEST_FINANCING_LONG_APR", 0.05),
+        backtest_financing_short_apr=env_float("BACKTEST_FINANCING_SHORT_APR", 0.0),
+        cftc_filter_enabled=env_bool("CFTC_FILTER_ENABLED", False),
+        cftc_state_max_age_days=env_int("CFTC_STATE_MAX_AGE_DAYS", 10),
+        cftc_extreme_percentile=env_float("CFTC_EXTREME_PERCENTILE", 0.85),
+        cftc_extreme_score_offset=env_float("CFTC_EXTREME_SCORE_OFFSET", 8.0),
     )
     _validate_settings(settings)
     return settings
@@ -426,3 +503,46 @@ def _validate_settings(settings: Settings) -> None:
         raise ValueError("Hard drawdown threshold must be <= soft drawdown threshold (more negative)")
     if not (0 < settings.drawdown_soft_risk_per_trade <= settings.max_risk_per_trade):
         raise ValueError("DRAWDOWN_SOFT_RISK_PER_TRADE must be > 0 and <= MAX_RISK_PER_TRADE")
+    # Sprint 2 validations
+    if not (0 <= settings.weekend_flatten_hour_utc <= 23):
+        raise ValueError("WEEKEND_FLATTEN_HOUR_UTC must be in [0, 23]")
+    if not (0 <= settings.weekend_stop_widen_hour_utc <= 23):
+        raise ValueError("WEEKEND_STOP_WIDEN_HOUR_UTC must be in [0, 23]")
+    if not (0 <= settings.weekend_block_new_entries_hour_utc <= 23):
+        raise ValueError("WEEKEND_BLOCK_NEW_ENTRIES_HOUR_UTC must be in [0, 23]")
+    if not (0 <= settings.weekend_flatten_weekday <= 6):
+        raise ValueError("WEEKEND_FLATTEN_WEEKDAY must be in [0, 6] (Mon=0..Sun=6)")
+    if settings.weekend_stop_widen_atr_mult < 0:
+        raise ValueError("WEEKEND_STOP_WIDEN_ATR_MULT must be >= 0")
+    if settings.weekend_block_new_entries_hour_utc > settings.weekend_flatten_hour_utc:
+        raise ValueError(
+            "WEEKEND_BLOCK_NEW_ENTRIES_HOUR_UTC must be <= WEEKEND_FLATTEN_HOUR_UTC"
+        )
+    if settings.calibration_min_trades_for_adjustment < 1:
+        raise ValueError("CALIBRATION_MIN_TRADES_FOR_ADJUSTMENT must be >= 1")
+    if settings.calibration_min_trades_for_block < settings.calibration_min_trades_for_adjustment:
+        raise ValueError(
+            "CALIBRATION_MIN_TRADES_FOR_BLOCK must be >= CALIBRATION_MIN_TRADES_FOR_ADJUSTMENT"
+        )
+    if settings.calibration_shrinkage_denominator < 1:
+        raise ValueError("CALIBRATION_SHRINKAGE_DENOMINATOR must be >= 1")
+    if settings.calibration_block_pf_threshold <= 0:
+        raise ValueError("CALIBRATION_BLOCK_PF_THRESHOLD must be > 0")
+    if not (0 <= settings.calibration_block_win_rate_threshold <= 1):
+        raise ValueError("CALIBRATION_BLOCK_WIN_RATE_THRESHOLD must be in [0, 1]")
+    if settings.backtest_spread_news_window_minutes < 0:
+        raise ValueError("BACKTEST_SPREAD_NEWS_WINDOW_MINUTES must be >= 0")
+    if settings.backtest_spread_news_multiplier < 1.0:
+        raise ValueError("BACKTEST_SPREAD_NEWS_MULTIPLIER must be >= 1.0")
+    if settings.backtest_exit_slippage_multiplier < 1.0:
+        raise ValueError("BACKTEST_EXIT_SLIPPAGE_MULTIPLIER must be >= 1.0")
+    if settings.backtest_financing_long_apr < 0 or settings.backtest_financing_short_apr < 0:
+        raise ValueError("BACKTEST_FINANCING_*_APR must be >= 0")
+    if not (0 <= settings.backtest_weekend_flatten_hour_utc <= 23):
+        raise ValueError("BACKTEST_WEEKEND_FLATTEN_HOUR_UTC must be in [0, 23]")
+    if not (0.5 <= settings.cftc_extreme_percentile <= 1.0):
+        raise ValueError("CFTC_EXTREME_PERCENTILE must be in [0.5, 1.0]")
+    if settings.cftc_extreme_score_offset < 0:
+        raise ValueError("CFTC_EXTREME_SCORE_OFFSET must be >= 0")
+    if settings.cftc_state_max_age_days < 1:
+        raise ValueError("CFTC_STATE_MAX_AGE_DAYS must be >= 1")

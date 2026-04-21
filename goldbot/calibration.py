@@ -27,7 +27,22 @@ log = logging.getLogger(__name__)
 CALIBRATION_REDIS_KEY = "gold_trade_calibration"
 CALIBRATION_FILE = "calibration.json"
 CALIBRATION_MAX_AGE_HOURS = 48.0
+# Minimum total trades for a calibration payload to be considered fresh enough
+# to consume at all. This is the *sample-size sanity* gate on the whole sweep,
+# not the per-strategy adjustment threshold (see CALIBRATION_MIN_TRADES_FOR_*
+# below).
 CALIBRATION_MIN_TRADES = 2
+
+# Per-strategy thresholds (Sprint 2: 2.7 calibration hardening). Adjustments
+# only apply when the strategy has accumulated meaningful sample size, and
+# even then are shrunk toward neutral until ~CALIBRATION_SHRINKAGE_DENOMINATOR
+# trades are observed (James-Stein style).
+CALIBRATION_MIN_TRADES_FOR_ADJUSTMENT = 40
+CALIBRATION_MIN_TRADES_FOR_BLOCK = 80
+CALIBRATION_SHRINKAGE_DENOMINATOR = 200
+CALIBRATION_BLOCK_PF_THRESHOLD = 0.7
+CALIBRATION_BLOCK_EXPECTANCY_THRESHOLD = -5.0
+CALIBRATION_BLOCK_WIN_RATE_THRESHOLD = 0.35
 
 
 def _utc_now() -> datetime:
@@ -38,45 +53,119 @@ def _profit_factor(wins_sum: float, losses_sum: float) -> float:
     return float(wins_sum / abs(losses_sum)) if losses_sum < 0 else 999.0
 
 
-def _derive_strategy_adjustment(metrics: Mapping[str, Any], *, min_trades: int) -> dict[str, Any]:
-    """Derive score-offset and risk multiplier for one strategy from its backtest metrics."""
+def _shrink_toward_neutral(raw_mult: float, raw_offset: float, *, trades: int, denominator: int) -> tuple[float, float]:
+    """Apply James-Stein-style shrinkage of (mult, offset) toward (1.0, 0.0).
+
+    The shrinkage factor is `min(1.0, trades / denominator)`. With 0 trades the
+    raw signal is fully discarded; with `denominator` trades it is fully kept.
+    Prevents tiny samples from yanking risk multipliers around.
+    """
+    denom = max(1, int(denominator))
+    weight = min(1.0, max(0.0, float(trades) / float(denom)))
+    shrunk_mult = 1.0 + (raw_mult - 1.0) * weight
+    shrunk_offset = raw_offset * weight
+    return shrunk_mult, shrunk_offset
+
+
+def _derive_strategy_adjustment(
+    metrics: Mapping[str, Any],
+    *,
+    min_trades_for_adjustment: int,
+    min_trades_for_block: int,
+    shrinkage_denominator: int,
+    block_pf_threshold: float = CALIBRATION_BLOCK_PF_THRESHOLD,
+    block_expectancy_threshold: float = CALIBRATION_BLOCK_EXPECTANCY_THRESHOLD,
+    block_win_rate_threshold: float = CALIBRATION_BLOCK_WIN_RATE_THRESHOLD,
+) -> dict[str, Any]:
+    """Derive score-offset and risk multiplier for one strategy from its backtest metrics.
+
+    Only computes any adjustment when the strategy has at least
+    `min_trades_for_adjustment` trades. Hard-blocks require
+    `min_trades_for_block` trades. All non-block adjustments are shrunk toward
+    neutral by the James-Stein factor `min(1, trades / shrinkage_denominator)`.
+    """
     trades = int(metrics.get("trades", 0) or 0)
-    if trades < min_trades:
+    if trades < min_trades_for_adjustment:
         return {"score_offset": 0.0, "risk_mult": 1.0, "block_reason": None}
 
     pf = float(metrics.get("profit_factor", 0.0) or 0.0)
     expectancy = float(metrics.get("expectancy", 0.0) or 0.0)
     win_rate = float(metrics.get("win_rate", 0.0) or 0.0)
 
-    # Hard block: persistent underperformance with meaningful sample
-    if trades >= max(6, min_trades * 2) and pf < 0.7 and expectancy < -5.0 and win_rate < 0.35:
+    # Hard block: persistent underperformance with statistically meaningful sample.
+    # Block is *not* shrunk — when all three thresholds are breached over a
+    # large sample, that's a real signal worth acting on at full strength.
+    if (
+        trades >= min_trades_for_block
+        and pf < block_pf_threshold
+        and expectancy < block_expectancy_threshold
+        and win_rate < block_win_rate_threshold
+    ):
         return {
             "score_offset": 0.0,
             "risk_mult": 0.5,
             "block_reason": "calibration block: persistent underperformance",
         }
 
-    # Underperforming: raise the bar
+    # Underperforming: raise the bar. Shrink toward neutral by sample size.
     if pf < 0.95 or expectancy < 0:
         tighten = min(10.0, round(max(0.0, (1.0 - pf) * 12.0) + max(0.0, -expectancy / 5.0), 2))
-        risk_mult = max(0.5, round(1.0 - min(0.4, tighten / 20.0), 2))
-        return {"score_offset": -tighten, "risk_mult": risk_mult, "block_reason": None}
+        raw_mult = max(0.5, round(1.0 - min(0.4, tighten / 20.0), 2))
+        shrunk_mult, shrunk_offset = _shrink_toward_neutral(
+            raw_mult, -tighten, trades=trades, denominator=shrinkage_denominator
+        )
+        return {
+            "score_offset": round(shrunk_offset, 2),
+            "risk_mult": round(shrunk_mult, 3),
+            "block_reason": None,
+        }
 
-    # Outperforming: relax slightly
+    # Outperforming: relax slightly. Same shrinkage applies.
     if pf > 1.2 and expectancy > 5.0 and win_rate > 0.5:
         relax = min(8.0, round((pf - 1.0) * 5.0 + min(3.0, expectancy / 10.0), 2))
-        risk_mult = min(1.25, round(1.0 + min(0.25, relax / 20.0), 2))
-        return {"score_offset": relax, "risk_mult": risk_mult, "block_reason": None}
+        raw_mult = min(1.25, round(1.0 + min(0.25, relax / 20.0), 2))
+        shrunk_mult, shrunk_offset = _shrink_toward_neutral(
+            raw_mult, relax, trades=trades, denominator=shrinkage_denominator
+        )
+        return {
+            "score_offset": round(shrunk_offset, 2),
+            "risk_mult": round(shrunk_mult, 3),
+            "block_reason": None,
+        }
 
     return {"score_offset": 0.0, "risk_mult": 1.0, "block_reason": None}
 
 
-def build_calibration(report: Mapping[str, Any], *, window_start: datetime, window_end: datetime, min_trades: int = CALIBRATION_MIN_TRADES) -> dict[str, Any]:
-    """Build a calibration payload from a backtest summary report."""
+def build_calibration(
+    report: Mapping[str, Any],
+    *,
+    window_start: datetime,
+    window_end: datetime,
+    min_trades: int = CALIBRATION_MIN_TRADES,
+    min_trades_for_adjustment: int = CALIBRATION_MIN_TRADES_FOR_ADJUSTMENT,
+    min_trades_for_block: int = CALIBRATION_MIN_TRADES_FOR_BLOCK,
+    shrinkage_denominator: int = CALIBRATION_SHRINKAGE_DENOMINATOR,
+    block_pf_threshold: float = CALIBRATION_BLOCK_PF_THRESHOLD,
+    block_expectancy_threshold: float = CALIBRATION_BLOCK_EXPECTANCY_THRESHOLD,
+    block_win_rate_threshold: float = CALIBRATION_BLOCK_WIN_RATE_THRESHOLD,
+) -> dict[str, Any]:
+    """Build a calibration payload from a backtest summary report.
+
+    `min_trades` is the legacy whole-sweep sample-size gate (kept for
+    backward-compat). The per-strategy thresholds are explicit kwargs.
+    """
     by_strategy = dict(report.get("by_strategy", {}))
     adjustments: dict[str, dict[str, Any]] = {}
     for strategy, metrics in by_strategy.items():
-        adjustments[strategy] = _derive_strategy_adjustment(metrics, min_trades=min_trades)
+        adjustments[strategy] = _derive_strategy_adjustment(
+            metrics,
+            min_trades_for_adjustment=min_trades_for_adjustment,
+            min_trades_for_block=min_trades_for_block,
+            shrinkage_denominator=shrinkage_denominator,
+            block_pf_threshold=block_pf_threshold,
+            block_expectancy_threshold=block_expectancy_threshold,
+            block_win_rate_threshold=block_win_rate_threshold,
+        )
 
     return {
         "generated_at": _utc_now().isoformat(),
@@ -88,6 +177,11 @@ def build_calibration(report: Mapping[str, Any], *, window_start: datetime, wind
         "total_pnl": float(report.get("total_pnl", 0.0) or 0.0),
         "by_strategy": by_strategy,
         "strategy_adjustments": adjustments,
+        "calibration_params": {
+            "min_trades_for_adjustment": int(min_trades_for_adjustment),
+            "min_trades_for_block": int(min_trades_for_block),
+            "shrinkage_denominator": int(shrinkage_denominator),
+        },
     }
 
 

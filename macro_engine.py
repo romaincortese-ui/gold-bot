@@ -7,6 +7,7 @@ from pathlib import Path
 from goldbot.config import load_settings
 from goldbot.news import fetch_calendar_events, filter_gold_events
 from goldbot.real_yields import build_real_yield_signal, fetch_real_yield_history, signal_to_payload
+from goldbot.cftc import signal_to_payload as cftc_signal_to_payload  # re-exported for downstream pipelines  # noqa: F401
 
 
 logging.basicConfig(
@@ -39,11 +40,31 @@ def main() -> None:
         "event_count": len(relevant),
         "events": [asdict(event) | {"occurs_at": event.occurs_at.isoformat()} for event in relevant],
         "real_yields": real_yields,
+        "cftc": _read_existing_cftc(settings.macro_state_file),
     }
     output_path = Path(settings.macro_state_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     log.info("Wrote %s relevant gold events to %s", len(relevant), output_path)
+
+
+def _read_existing_cftc(macro_state_file: str) -> dict | None:
+    """Preserve any externally-published CFTC payload across macro refreshes.
+
+    The CoT report only refreshes weekly; the macro engine runs frequently.
+    A separate pipeline (manual CSV import or scheduled fetch) is responsible
+    for writing the ``cftc`` key. Without this passthrough, every macro
+    refresh would clobber the positioning data with ``None``.
+    """
+    try:
+        path = Path(macro_state_file)
+        if not path.exists():
+            return None
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        cftc = existing.get("cftc")
+        return cftc if isinstance(cftc, dict) else None
+    except Exception:
+        return None
 
 
 if __name__ == "__main__":
