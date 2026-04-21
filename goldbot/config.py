@@ -263,6 +263,40 @@ class Settings:
     cftc_extreme_percentile: float = 0.85        # 85th pctile triggers fade
     cftc_extreme_score_offset: float = 8.0       # +/- score offset applied to crowded side
 
+    # --- Sprint 3 (Apr 2026): cross-asset co-trade / regime / options IV /
+    # walk-forward / execution tightening. All disabled-by-default until
+    # their upstream data pipelines are live in macro_engine.
+    co_trade_gates_enabled: bool = False
+    co_trade_state_max_age_hours: int = 24
+    co_trade_es_risk_on_long_veto_pct: float = 0.015     # ES +1.5% day → no long-gold
+    co_trade_cnh_stress_short_veto_pct: float = 0.004    # USD/CNH +0.4% → no short-gold
+    co_trade_dxy_weak_favourable_pct: float = -0.003     # DXY -0.3% → size up long
+    co_trade_favourable_size_mult: float = 1.25
+
+    regime_filter_enabled: bool = False
+    regime_quiet_atr_pct_max: float = 0.006              # ATR% ≤ 0.6% → quiet_carry
+    regime_trend_atr_pct_max: float = 0.014              # 0.6% < ATR% ≤ 1.4% → trend
+    regime_spike_atr_pct_min: float = 0.016              # ATR% ≥ 1.6% → spike
+    regime_quiet_strategies: str = "EXHAUSTION_REVERSAL"
+    regime_trend_strategies: str = "TREND_PULLBACK,MACRO_BREAKOUT"
+    regime_spike_strategies: str = "MACRO_BREAKOUT"
+
+    options_iv_gate_enabled: bool = False
+    options_iv_state_max_age_hours: int = 24
+    options_iv_realised_fraction_threshold: float = 0.60  # 1h realised / 1d implied
+
+    walk_forward_enabled: bool = False
+    walk_forward_in_sample_days: int = 275
+    walk_forward_out_sample_days: int = 90
+    walk_forward_step_days: int = 90
+    walk_forward_min_out_sample_pf: float = 1.15
+    walk_forward_max_pf_degradation: float = 0.50
+
+    execution_use_limit_entry: bool = False
+    execution_limit_spread_multiplier: float = 1.25
+    execution_limit_timeout_seconds: int = 3
+    execution_guaranteed_stop_enabled: bool = False
+
 
 def load_settings() -> Settings:
     settings = Settings(
@@ -408,6 +442,33 @@ def load_settings() -> Settings:
         cftc_state_max_age_days=env_int("CFTC_STATE_MAX_AGE_DAYS", 10),
         cftc_extreme_percentile=env_float("CFTC_EXTREME_PERCENTILE", 0.85),
         cftc_extreme_score_offset=env_float("CFTC_EXTREME_SCORE_OFFSET", 8.0),
+        # Sprint 3 knobs
+        co_trade_gates_enabled=env_bool("CO_TRADE_GATES_ENABLED", False),
+        co_trade_state_max_age_hours=env_int("CO_TRADE_STATE_MAX_AGE_HOURS", 24),
+        co_trade_es_risk_on_long_veto_pct=env_float("CO_TRADE_ES_RISK_ON_LONG_VETO_PCT", 0.015),
+        co_trade_cnh_stress_short_veto_pct=env_float("CO_TRADE_CNH_STRESS_SHORT_VETO_PCT", 0.004),
+        co_trade_dxy_weak_favourable_pct=env_float("CO_TRADE_DXY_WEAK_FAVOURABLE_PCT", -0.003),
+        co_trade_favourable_size_mult=env_float("CO_TRADE_FAVOURABLE_SIZE_MULT", 1.25),
+        regime_filter_enabled=env_bool("REGIME_FILTER_ENABLED", False),
+        regime_quiet_atr_pct_max=env_float("REGIME_QUIET_ATR_PCT_MAX", 0.006),
+        regime_trend_atr_pct_max=env_float("REGIME_TREND_ATR_PCT_MAX", 0.014),
+        regime_spike_atr_pct_min=env_float("REGIME_SPIKE_ATR_PCT_MIN", 0.016),
+        regime_quiet_strategies=env_str("REGIME_QUIET_STRATEGIES", "EXHAUSTION_REVERSAL"),
+        regime_trend_strategies=env_str("REGIME_TREND_STRATEGIES", "TREND_PULLBACK,MACRO_BREAKOUT"),
+        regime_spike_strategies=env_str("REGIME_SPIKE_STRATEGIES", "MACRO_BREAKOUT"),
+        options_iv_gate_enabled=env_bool("OPTIONS_IV_GATE_ENABLED", False),
+        options_iv_state_max_age_hours=env_int("OPTIONS_IV_STATE_MAX_AGE_HOURS", 24),
+        options_iv_realised_fraction_threshold=env_float("OPTIONS_IV_REALISED_FRACTION_THRESHOLD", 0.60),
+        walk_forward_enabled=env_bool("WALK_FORWARD_ENABLED", False),
+        walk_forward_in_sample_days=env_int("WALK_FORWARD_IN_SAMPLE_DAYS", 275),
+        walk_forward_out_sample_days=env_int("WALK_FORWARD_OUT_SAMPLE_DAYS", 90),
+        walk_forward_step_days=env_int("WALK_FORWARD_STEP_DAYS", 90),
+        walk_forward_min_out_sample_pf=env_float("WALK_FORWARD_MIN_OUT_SAMPLE_PF", 1.15),
+        walk_forward_max_pf_degradation=env_float("WALK_FORWARD_MAX_PF_DEGRADATION", 0.50),
+        execution_use_limit_entry=env_bool("EXECUTION_USE_LIMIT_ENTRY", False),
+        execution_limit_spread_multiplier=env_float("EXECUTION_LIMIT_SPREAD_MULTIPLIER", 1.25),
+        execution_limit_timeout_seconds=env_int("EXECUTION_LIMIT_TIMEOUT_SECONDS", 3),
+        execution_guaranteed_stop_enabled=env_bool("EXECUTION_GUARANTEED_STOP_ENABLED", False),
     )
     _validate_settings(settings)
     return settings
@@ -546,3 +607,36 @@ def _validate_settings(settings: Settings) -> None:
         raise ValueError("CFTC_EXTREME_SCORE_OFFSET must be >= 0")
     if settings.cftc_state_max_age_days < 1:
         raise ValueError("CFTC_STATE_MAX_AGE_DAYS must be >= 1")
+    # Sprint 3 validations
+    if settings.co_trade_state_max_age_hours < 0:
+        raise ValueError("CO_TRADE_STATE_MAX_AGE_HOURS must be >= 0")
+    if settings.co_trade_es_risk_on_long_veto_pct <= 0:
+        raise ValueError("CO_TRADE_ES_RISK_ON_LONG_VETO_PCT must be > 0")
+    if settings.co_trade_cnh_stress_short_veto_pct <= 0:
+        raise ValueError("CO_TRADE_CNH_STRESS_SHORT_VETO_PCT must be > 0")
+    if settings.co_trade_dxy_weak_favourable_pct >= 0:
+        raise ValueError("CO_TRADE_DXY_WEAK_FAVOURABLE_PCT must be < 0 (a DXY decline)")
+    if settings.co_trade_favourable_size_mult < 1.0:
+        raise ValueError("CO_TRADE_FAVOURABLE_SIZE_MULT must be >= 1.0")
+    if settings.regime_quiet_atr_pct_max <= 0:
+        raise ValueError("REGIME_QUIET_ATR_PCT_MAX must be > 0")
+    if settings.regime_trend_atr_pct_max < settings.regime_quiet_atr_pct_max:
+        raise ValueError("REGIME_TREND_ATR_PCT_MAX must be >= REGIME_QUIET_ATR_PCT_MAX")
+    if settings.regime_spike_atr_pct_min < settings.regime_trend_atr_pct_max:
+        raise ValueError("REGIME_SPIKE_ATR_PCT_MIN must be >= REGIME_TREND_ATR_PCT_MAX")
+    if settings.options_iv_state_max_age_hours < 0:
+        raise ValueError("OPTIONS_IV_STATE_MAX_AGE_HOURS must be >= 0")
+    if not (0.0 < settings.options_iv_realised_fraction_threshold <= 5.0):
+        raise ValueError("OPTIONS_IV_REALISED_FRACTION_THRESHOLD must be in (0, 5]")
+    if settings.walk_forward_in_sample_days <= 0 or settings.walk_forward_out_sample_days <= 0:
+        raise ValueError("Walk-forward window sizes must be > 0")
+    if settings.walk_forward_step_days <= 0:
+        raise ValueError("WALK_FORWARD_STEP_DAYS must be > 0")
+    if settings.walk_forward_min_out_sample_pf <= 0:
+        raise ValueError("WALK_FORWARD_MIN_OUT_SAMPLE_PF must be > 0")
+    if not (0.0 <= settings.walk_forward_max_pf_degradation <= 1.0):
+        raise ValueError("WALK_FORWARD_MAX_PF_DEGRADATION must be in [0, 1]")
+    if settings.execution_limit_spread_multiplier < 0:
+        raise ValueError("EXECUTION_LIMIT_SPREAD_MULTIPLIER must be >= 0")
+    if settings.execution_limit_timeout_seconds < 1:
+        raise ValueError("EXECUTION_LIMIT_TIMEOUT_SECONDS must be >= 1")

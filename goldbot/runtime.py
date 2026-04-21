@@ -29,6 +29,13 @@ from goldbot.news_scoring import load_event_scores
 from goldbot.kill_switch import EquityHistory, evaluate_kill_switch, latch_halt_state
 from goldbot.real_yields import apply_real_yield_overlay, load_real_yield_signal_from_macro_state
 from goldbot.cftc import apply_cftc_overlay, load_cftc_signal_from_macro_state
+from goldbot.co_trade import apply_co_trade_gates, load_co_trade_signal_from_macro_state
+from goldbot.options_iv import (
+    evaluate_options_iv_gate,
+    load_options_iv_signal_from_macro_state,
+    should_gate_strategy as options_iv_should_gate_strategy,
+)
+from goldbot.regime import classify_from_settings, parse_strategy_csv, strategy_allowed_in_regime
 from goldbot.shared_backend import load_json_payload, publish_runtime_status, save_json_payload
 from goldbot.sizing import compute_risk_amount
 from goldbot.spread_tracker import SpreadTracker
@@ -306,6 +313,16 @@ class GoldBotRuntime:
             now,
             max_age_days=self.settings.cftc_state_max_age_days,
         )
+        co_trade_signal = load_co_trade_signal_from_macro_state(
+            self.settings.macro_state_file,
+            now,
+            max_age_hours=self.settings.co_trade_state_max_age_hours,
+        )
+        options_iv_signal = load_options_iv_signal_from_macro_state(
+            self.settings.macro_state_file,
+            now,
+            max_age_hours=self.settings.options_iv_state_max_age_hours,
+        )
         scored_events = load_event_scores(
             self.settings.macro_state_file,
             now=now,
@@ -337,20 +354,66 @@ class GoldBotRuntime:
                 score_trend_pullback(self.settings, df_h1, df_h4, usd_proxy_frames, reasons=rejection_reasons),
             ]
 
+        # Sprint 3 §3.2: classify current vol regime from H4 ATR% (falls back
+        # to H1 if H4 unavailable) and filter strategies not allowed under it.
+        regime_classification = self._classify_regime(df_h1, df_h4, relevant_events, now)
+        if regime_classification is not None:
+            log.info(
+                "Regime classification: %s (atr_pct=%.4f news_burst=%s)",
+                regime_classification.regime,
+                regime_classification.atr_pct,
+                regime_classification.news_burst,
+            )
+
         calibrated: list[Opportunity] = []
         for opportunity in opportunities:
             if opportunity is None or self._is_cooldown_active(state, opportunity, now):
                 continue
+            if regime_classification is not None and self.settings.regime_filter_enabled:
+                if not strategy_allowed_in_regime(
+                    regime_classification.regime,
+                    opportunity.strategy,
+                    quiet_strategies=parse_strategy_csv(self.settings.regime_quiet_strategies),
+                    trend_strategies=parse_strategy_csv(self.settings.regime_trend_strategies),
+                    spike_strategies=parse_strategy_csv(self.settings.regime_spike_strategies),
+                ):
+                    rejection_reasons.append(
+                        f"regime_filter:{opportunity.strategy}_not_allowed_in_{regime_classification.regime}"
+                    )
+                    continue
             adj = get_strategy_adjustment(self.calibration, opportunity.strategy)
             if adj.get("block_reason"):
                 log.info("Calibration blocked %s: %s", opportunity.strategy, adj["block_reason"])
                 continue
             opportunity.score += float(adj.get("score_offset", 0.0))
             opportunity.metadata["calibration_risk_mult"] = float(adj.get("risk_mult", 1.0))
+            if regime_classification is not None:
+                opportunity.metadata["regime"] = regime_classification.regime
+                opportunity.metadata["regime_atr_pct"] = round(regime_classification.atr_pct, 5)
+            # Sprint 3 §3.3: options-IV gate for MACRO_BREAKOUT only.
+            if options_iv_should_gate_strategy(self.settings, opportunity.strategy):
+                realised_1h_pct = self._realised_1h_move_pct(df_m15)
+                if (
+                    options_iv_signal is not None
+                    and realised_1h_pct is not None
+                ):
+                    gate = evaluate_options_iv_gate(
+                        realised_move_pct=realised_1h_pct,
+                        implied_1d_move_pct=options_iv_signal.implied_1d_move_pct,
+                        threshold_fraction=self.settings.options_iv_realised_fraction_threshold,
+                    )
+                    opportunity.metadata["options_iv_ratio"] = round(gate.ratio, 3)
+                    opportunity.metadata["options_iv_threshold"] = gate.threshold_fraction
+                    if not gate.passed:
+                        rejection_reasons.append(f"options_iv_gate:{gate.reason}")
+                        continue
             filtered = apply_real_yield_overlay(self.settings, opportunity, real_yield_signal)
             if filtered is not None:
                 filtered = apply_cftc_overlay(self.settings, filtered, cftc_signal)
-                calibrated.append(filtered)
+                # Sprint 3 §3.1: co-trade gates can still veto an opportunity.
+                filtered = apply_co_trade_gates(self.settings, filtered, co_trade_signal)
+                if filtered is not None:
+                    calibrated.append(filtered)
 
         best = select_best_opportunity(calibrated)
         if best is None:
@@ -699,6 +762,54 @@ class GoldBotRuntime:
         except Exception:
             log.exception("ATR estimate fetch failed")
             return None
+
+    def _classify_regime(self, df_h1, df_h4, relevant_events, now):
+        """Sprint 3 §3.2: classify the current regime from ATR% and news burst."""
+        if df_h4 is None and df_h1 is None:
+            return None
+        frame = df_h4 if df_h4 is not None and not df_h4.empty else df_h1
+        if frame is None or frame.empty:
+            return None
+        try:
+            atr = float(calc_atr(frame, self.settings.atr_period))
+            close = float(frame.iloc[-1]["close"])
+        except Exception:
+            log.exception("Regime ATR calc failed")
+            return None
+        if close <= 0:
+            return None
+        atr_pct = atr / close
+        news_burst = False
+        if relevant_events:
+            burst_window = timedelta(minutes=self.settings.post_news_settle_minutes)
+            for event in relevant_events:
+                occurs_at = getattr(event, "occurs_at", None)
+                if occurs_at is None:
+                    continue
+                delta = now - occurs_at
+                if timedelta(0) <= delta <= burst_window:
+                    news_burst = True
+                    break
+        return classify_from_settings(self.settings, atr_pct=atr_pct, news_burst=news_burst)
+
+    @staticmethod
+    def _realised_1h_move_pct(df_m15) -> float | None:
+        """Return the last-hour realised abs-% move on the M15 frame.
+
+        Uses the last four M15 closes (≈1h) to approximate a 1h move without
+        needing a separate H1 re-fetch. Returns ``None`` when the frame is
+        too short or the reference close is non-positive.
+        """
+        if df_m15 is None or len(df_m15) < 5:
+            return None
+        try:
+            latest_close = float(df_m15.iloc[-1]["close"])
+            ref_close = float(df_m15.iloc[-5]["close"])
+        except Exception:
+            return None
+        if ref_close <= 0:
+            return None
+        return abs(latest_close - ref_close) / ref_close
 
     def _process_control_requests(self, state: dict) -> None:
         requests = list(state.get("control_requests", []))
