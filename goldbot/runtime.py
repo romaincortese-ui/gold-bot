@@ -106,6 +106,9 @@ class GoldBotRuntime:
         bootstrap_state.setdefault("last_session", None)
         bootstrap_state.setdefault("skip_reason", None)
         self._publish_runtime_status("booting", bootstrap_state, balance=bootstrap_state.get("account_balance"))
+        # Gate A G1+G4 (memo 1 §7): single structured boot line so the operator
+        # can see exactly which mode and which overlays are actually live.
+        self._log_boot_manifest()
         self._announce_telegram_startup()
         next_cycle_at = time.monotonic()
         next_telegram_at = time.monotonic() if self.telegram_client is not None else float("inf")
@@ -453,10 +456,17 @@ class GoldBotRuntime:
 
         best = select_best_opportunity(calibrated)
         if best is None:
-            if rejection_reasons:
-                log.info("No XAU/USD opportunity passed filters | %s", " ; ".join(rejection_reasons))
-            else:
-                log.info("No XAU/USD opportunity passed filters")
+            # Gate A G5 (memo 1 §7): structured telemetry so the operator can
+            # see which sleeves were evaluated and why they were rejected
+            # without having to reconstruct it from free-text log lines.
+            candidate_count = len(calibrated)
+            reasons_str = " ; ".join(rejection_reasons) if rejection_reasons else "no_candidate"
+            log.info(
+                "[OPPORTUNITY] session=%s candidates=%d reasons=%s",
+                session_name,
+                candidate_count,
+                reasons_str,
+            )
             state.update({
                 "last_run_at": now.isoformat(),
                 "last_session": session_name,
@@ -522,6 +532,19 @@ class GoldBotRuntime:
 
         try:
             entry_quote = self._await_entry_quote(best)
+            # Gate A G5 (memo 1 §7): audit line immediately before the OANDA
+            # call — exposes spread the bot actually saw vs. the configured
+            # cap at entry time, matching the FX-bot [ENTRY_SPREAD] pattern.
+            entry_spread = float(entry_quote.get("spread", 0.0) or 0.0) if entry_quote else 0.0
+            log.info(
+                "[ENTRY_SPREAD] strategy=%s instrument=%s direction=%s spread=%.4f cap=%.2f mode=%s",
+                best.strategy,
+                self.settings.instrument,
+                best.direction,
+                entry_spread,
+                self.settings.max_entry_spread,
+                self.settings.execution_mode,
+            )
             result = self.client.place_market_order(best, size, quote=entry_quote)
         except SpreadTooWideError as exc:
             log.info("Skipping execution because spread is too wide: %s", exc)
@@ -1135,8 +1158,85 @@ class GoldBotRuntime:
                 return True
         return False
 
-    @staticmethod
-    def _record_event(state: dict, event_type: str, message: str, *, now: datetime) -> None:
+    def _log_boot_manifest(self) -> None:
+        """Gate A G1+G4 — single ``[BOOT]`` log line so deploy-state is readable at a glance.
+
+        Covers:
+
+        * OANDA environment (practice / live) and the effective ``EXECUTION_MODE``.
+          On a fxPractice account ``live`` hits the OANDA demo order path; on a
+          real live account ``live`` ships real orders. ``signal_only`` never
+          calls ``place_order`` at all. If the operator is on practice but
+          still in ``signal_only`` a WARN is emitted so the state is impossible
+          to miss.
+        * All Q2 / Tier-3 overlay flags (miners, 3-factor, CB-flow veto, risk-parity,
+          options-IV, CFTC, co-trade, real-yield, USD regime, volume mode).
+        """
+        s = self.settings
+        overlays = {
+            "usd_regime": s.usd_regime_filter_enabled,
+            "real_yield_filter": s.real_yield_filter_enabled,
+            "breakout_volume_mode": s.breakout_volume_mode,
+            "vol_target_sizing": s.vol_target_sizing_enabled,
+            "drawdown_kill": s.drawdown_kill_switch_enabled,
+            "cftc": s.cftc_filter_enabled,
+            "co_trade": s.co_trade_gates_enabled,
+            "options_iv": s.options_iv_gate_enabled,
+            "miners_overlay": s.miners_overlay_enabled,
+            "factor_model": s.factor_model_enabled,
+            "central_bank_flow": s.central_bank_flow_enabled,
+            "risk_parity": s.risk_parity_enabled,
+        }
+        overlay_str = " ".join(
+            f"{k}={'on' if v is True else ('off' if v is False else v)}"
+            for k, v in overlays.items()
+        )
+        log.info(
+            "[BOOT] env=%s exec_mode=%s account_type=%s instrument=%s max_entry_spread=%.2f %s",
+            s.oanda_environment,
+            s.execution_mode,
+            s.account_type,
+            s.instrument,
+            s.max_entry_spread,
+            overlay_str,
+        )
+        # Surface the most common misconfiguration: being on a demo account
+        # but still in ``signal_only`` so nothing ever gets placed against the
+        # fxPractice broker. Loud warning rather than silent log so the
+        # operator reads it on redeploy.
+        if (
+            s.oanda_environment == "practice"
+            and s.execution_mode == "signal_only"
+        ):
+            log.warning(
+                "[BOOT] EXECUTION_MODE=signal_only on practice account — "
+                "no orders will be submitted. Set EXECUTION_MODE=live to "
+                "exercise the OANDA fxPractice order path."
+            )
+
+    # Gate A G2 (memo 1 §7): refuse to persist test-sentinel payloads into
+    # the production state file. Historical state.json contained 10 residual
+    # ``Cycle error: boom`` events from dev/test runs that wrote into the
+    # real file. This guard is intentionally narrow — it only rejects exact
+    # token matches known to come from unit-test mocks.
+    _TEST_SENTINEL_TOKENS = ("boom",)
+
+    @classmethod
+    def _is_test_sentinel(cls, message: str) -> bool:
+        if not message:
+            return False
+        lowered = message.strip().lower()
+        for token in cls._TEST_SENTINEL_TOKENS:
+            # Exact-word match only; avoid swallowing a real error that
+            # happens to contain the substring.
+            if lowered == token or lowered.endswith(f": {token}"):
+                return True
+        return False
+
+    @classmethod
+    def _record_event(cls, state: dict, event_type: str, message: str, *, now: datetime) -> None:
+        if cls._is_test_sentinel(message):
+            return
         events = state.setdefault("events", [])
         events.append(
             {
