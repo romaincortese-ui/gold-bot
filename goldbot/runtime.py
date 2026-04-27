@@ -522,10 +522,45 @@ class GoldBotRuntime:
             self._publish_runtime_status("risk_budget_exhausted", state, balance=balance)
             return None
 
-        size = self.client.calculate_xau_size(risk_amount, best.risk_per_unit, account_currency)
+        target_risk_amount = risk_amount
+        size = self.client.calculate_xau_size(target_risk_amount, best.risk_per_unit, account_currency)
         if size <= 0:
             log.info("Unable to size XAU/USD trade")
-            state.update({"last_run_at": now.isoformat(), "last_session": session_name, "skip_reason": "size_zero"})
+            state.update({
+                "last_run_at": now.isoformat(),
+                "last_session": session_name,
+                "skip_reason": "size_zero",
+                "last_signal": {
+                    **asdict(best),
+                    "risk_amount": target_risk_amount,
+                    "size": size,
+                    "budget_snapshot": asdict(snapshot),
+                    "sizing_reject_reason": "minimum_xau_unit_exceeds_risk_budget",
+                },
+            })
+            self._save_state(state)
+            self._publish_runtime_status("size_zero", state, balance=balance)
+            return None
+
+        risk_amount = self.client.estimate_xau_risk_amount(size, best.risk_per_unit, account_currency)
+        if risk_amount <= 0 or risk_amount > target_risk_amount + max(0.01, target_risk_amount * 0.01):
+            log.warning(
+                "Sized XAU/USD risk %.2f exceeds target budget %.2f; skipping entry",
+                risk_amount,
+                target_risk_amount,
+            )
+            state.update({
+                "last_run_at": now.isoformat(),
+                "last_session": session_name,
+                "skip_reason": "size_exceeds_risk_budget",
+                "last_signal": {
+                    **asdict(best),
+                    "risk_amount": target_risk_amount,
+                    "sized_risk_amount": risk_amount,
+                    "size": size,
+                    "budget_snapshot": asdict(snapshot),
+                },
+            })
             self._save_state(state)
             self._publish_runtime_status("size_zero", state, balance=balance)
             return None
@@ -574,13 +609,27 @@ class GoldBotRuntime:
             risk_amount,
             result.get("mode", self.settings.execution_mode),
         )
+        trade_record = self._build_trade_record(best, result, size, risk_amount, now)
+        reserved_after = snapshot.reserved_gold_risk + risk_amount
         self._record_event(
             state,
             "trade_opened",
-            f"{best.strategy} {best.direction} opened at {result.get('price', best.entry_price)} | size {size} | mode {result.get('mode', self.settings.execution_mode)}",
+            f"{best.strategy} {best.direction} opened at {result.get('price', best.entry_price)} | size {size} | risk {risk_amount:.2f} | mode {result.get('mode', self.settings.execution_mode)}",
             now=now,
+            details={
+                **trade_record,
+                "mode": result.get("mode", self.settings.execution_mode),
+                "score": float(best.score),
+                "account_currency": account_currency,
+                "target_risk_amount": float(target_risk_amount),
+                "gold_sleeve_balance": float(snapshot.gold_sleeve_balance),
+                "max_trade_risk_amount": float(snapshot.max_trade_risk_amount),
+                "max_total_risk_amount": float(snapshot.max_total_risk_amount),
+                "reserved_gold_risk_before": float(snapshot.reserved_gold_risk),
+                "reserved_gold_risk_after": float(reserved_after),
+                "available_gold_risk_after": float(max(0.0, snapshot.max_total_risk_amount - reserved_after)),
+            },
         )
-        trade_record = self._build_trade_record(best, result, size, risk_amount, now)
         state.setdefault("open_trades", []).append(trade_record)
         state.setdefault("signals", []).append({
             "opened_at": now.isoformat(),
@@ -1234,18 +1283,19 @@ class GoldBotRuntime:
         return False
 
     @classmethod
-    def _record_event(cls, state: dict, event_type: str, message: str, *, now: datetime) -> None:
+    def _record_event(cls, state: dict, event_type: str, message: str, *, now: datetime, details: dict | None = None) -> None:
         if cls._is_test_sentinel(message):
             return
         events = state.setdefault("events", [])
-        events.append(
-            {
-                "id": str(uuid.uuid4()),
-                "timestamp": now.isoformat(),
-                "type": event_type,
-                "message": message,
-            }
-        )
+        event = {
+            "id": str(uuid.uuid4()),
+            "timestamp": now.isoformat(),
+            "type": event_type,
+            "message": message,
+        }
+        if details:
+            event["details"] = details
+        events.append(event)
         if len(events) > 200:
             del events[:-200]
 

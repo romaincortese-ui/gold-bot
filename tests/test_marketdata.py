@@ -59,3 +59,21 @@ def test_fetch_candles_range_paginates_large_windows(monkeypatch) -> None:
 
     assert frame is not None
     assert len(requests_seen) >= 2
+
+
+def test_live_xau_size_does_not_round_up_past_risk_budget(monkeypatch) -> None:
+    settings = build_settings()
+    settings = type(settings)(
+        **{
+            **settings.__dict__,
+            "execution_mode": "live",
+            "oanda_api_key": "key",
+            "oanda_account_id": "account",
+        }
+    )
+    client = OandaClient(settings)
+    monkeypatch.setattr(client, "_estimate_conversion_rate", lambda base, quote: 0.75)
+
+    assert client.calculate_xau_size(0.72, 59.111, "GBP") == 0.0
+    assert client.calculate_xau_size(100.0, 50.0, "GBP") == 2.0
+    assert client.estimate_xau_risk_amount(2.0, 50.0, "GBP") == 75.0

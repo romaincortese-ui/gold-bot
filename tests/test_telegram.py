@@ -285,8 +285,118 @@ def test_status_message_surfaces_broker_snapshot_error(tmp_path, monkeypatch) ->
 
     assert "NAV: GBP11,120.00" in message
     assert "📉 Unrealized: GBP120.00" in message
-    assert "Margin used: GBP220.00" in message
-    assert "Margin available: GBP10,880.00" in message
+    assert "🏦 <b>Broker margin</b>" in message
+    assert "Used: GBP220.00" in message
+    assert "Available: GBP10,880.00" in message
+    assert "not the Gold-bot budget" in message
+
+
+def test_status_message_separates_margin_from_gold_risk_budget(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    client = GoldTelegramClient(
+        token="token",
+        chat_id="123",
+        state_path=tmp_path / "state.json",
+        offset_path=tmp_path / "telegram_state.json",
+    )
+    client.budget.path = tmp_path / "shared_budget_state.json"
+    client.budget.redis_key = "test_shared_budget"
+    client.budget.path.write_text(
+        '{"bots":{"gold":{"reserved_risk":0.72,"trades":{"live-1":{"risk_amount":0.72,"strategy":"TREND_PULLBACK"}}}}}',
+        encoding="utf-8",
+    )
+
+    message = client._build_status_message(
+        {
+            "last_run_at": "2026-04-27T13:25:00+00:00",
+            "last_session": "OVERLAP",
+            "skip_reason": "open_gold_position",
+            "paused": False,
+            "account_balance": 191.90,
+            "account_nav": 197.02,
+            "account_unrealized_pl": 5.12,
+            "account_margin_used": 173.31,
+            "account_margin_available": 23.97,
+            "account_currency": "GBP",
+            "execution_mode": "live",
+            "open_trades": [
+                {
+                    "id": "live-1",
+                    "instrument": "XAU_USD",
+                    "strategy": "TREND_PULLBACK",
+                    "direction": "SHORT",
+                    "entry_price": 4705.81,
+                    "stop_price": 4764.92126537547,
+                    "initial_stop_price": 4764.92126537547,
+                    "initial_risk_per_unit": 59.11126537547,
+                    "size": 1.0,
+                    "remaining_size": 1.0,
+                    "risk_amount": 0.72,
+                    "opened_at": "2026-04-27T09:01:00+00:00",
+                    "exit_plan": {
+                        "partial_take_profit_price": 4652.61,
+                        "break_even_trigger_price": 4628.966,
+                        "trail_timeframe": "H1",
+                        "trailing_stop_distance": 165.511,
+                    },
+                }
+            ],
+        }
+    )
+
+    assert "🛡️ <b>Gold risk budget</b>" in message
+    assert "Sleeve: GBP95.95" in message
+    assert "Reserved by gold: GBP0.72" in message
+    assert "🏦 <b>Broker margin</b>" in message
+    assert "Used: GBP173.31" in message
+    assert "not the Gold-bot budget" in message
+    assert "Stop 4764.921" in message
+    assert "Partial TP: 4652.610 (50%)" in message
+
+
+def test_trade_opened_event_shows_budget_tp_and_sl() -> None:
+    message = GoldTelegramClient._format_event(
+        {
+            "timestamp": "2026-04-27T09:01:00+00:00",
+            "type": "trade_opened",
+            "message": "legacy fallback",
+            "details": {
+                "instrument": "XAU_USD",
+                "strategy": "TREND_PULLBACK",
+                "direction": "SHORT",
+                "entry_price": 4705.81,
+                "stop_price": 4764.92126537547,
+                "initial_stop_price": 4764.92126537547,
+                "initial_risk_per_unit": 59.11126537547,
+                "size": 1.0,
+                "remaining_size": 1.0,
+                "risk_amount": 0.72,
+                "opened_at": "2026-04-27T09:01:00+00:00",
+                "exit_plan": {
+                    "partial_take_profit_price": 4652.61,
+                    "break_even_trigger_price": 4628.966,
+                    "trail_timeframe": "H1",
+                    "trailing_stop_distance": 165.511,
+                },
+                "mode": "live",
+                "score": 76.3069,
+                "account_currency": "GBP",
+                "gold_sleeve_balance": 95.95,
+                "max_trade_risk_amount": 0.72,
+                "max_total_risk_amount": 2.88,
+                "reserved_gold_risk_after": 0.72,
+                "available_gold_risk_after": 2.16,
+            },
+        }
+    )
+
+    assert "Gold: Trade Opened" in message
+    assert "Entry 4705.810" in message
+    assert "Stop 4764.921" in message
+    assert "Partial TP: 4652.610 (50%)" in message
+    assert "Break-even trigger: 4628.966" in message
+    assert "Risk reserved: GBP0.72 / max trade GBP0.72" in message
+    assert "OANDA margin shown in /status" in message
 
 
 def test_poll_commands_swallows_read_timeout(tmp_path, monkeypatch, caplog) -> None:

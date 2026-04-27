@@ -196,12 +196,19 @@ class OandaClient:
             return 0.0
         if not self.uses_native_units():
             stake = risk_amount / stop_distance
-            return max(0.1, math.floor(stake * 100) / 100)  # round DOWN to never exceed intended risk
+            return max(0.0, math.floor(stake * 100) / 100)  # round DOWN to never exceed intended risk
         conversion = self._estimate_conversion_rate("USD", account_currency)
         per_unit_risk = stop_distance * conversion
         if per_unit_risk <= 0:
             return 0.0
-        return max(1.0, round(risk_amount / per_unit_risk))
+        units = math.floor(risk_amount / per_unit_risk)
+        return float(units) if units >= 1 else 0.0
+
+    def estimate_xau_risk_amount(self, size: float, stop_distance: float, account_currency: str) -> float:
+        if size <= 0 or stop_distance <= 0:
+            return 0.0
+        conversion = self._estimate_conversion_rate("USD", account_currency) if self.uses_native_units() else 1.0
+        return abs(float(size)) * float(stop_distance) * float(conversion)
 
     def place_market_order(self, opportunity: Opportunity, size: float, *, quote: dict[str, float] | None = None) -> dict:
         quote = quote or self.get_price(self.settings.instrument)

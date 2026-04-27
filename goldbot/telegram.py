@@ -256,6 +256,36 @@ class GoldTelegramClient:
         return f"{code}{numeric:,.2f}"
 
     @staticmethod
+    def _to_float(value: float | int | str | None) -> float | None:
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _format_price(cls, value: float | int | str | None, digits: int = 3) -> str:
+        numeric = cls._to_float(value)
+        if numeric is None:
+            return "n/a"
+        return f"{numeric:.{digits}f}"
+
+    @classmethod
+    def _format_size(cls, value: float | int | str | None) -> str:
+        numeric = cls._to_float(value)
+        if numeric is None:
+            return "n/a"
+        return f"{numeric:.2f}"
+
+    @classmethod
+    def _format_score(cls, value: float | int | str | None) -> str:
+        numeric = cls._to_float(value)
+        if numeric is None:
+            return "n/a"
+        return f"{numeric:.2f}"
+
+    @staticmethod
     def _format_bool(value: bool) -> str:
         return "Paused" if value else "Running"
 
@@ -268,11 +298,12 @@ class GoldTelegramClient:
             "open_gold_position": "existing gold position",
             "pre_news_pause": "pre-news pause",
             "risk_budget_exhausted": "risk budget exhausted",
-            "size_zero": "size rounded to zero",
+            "size_zero": "minimum trade size exceeds risk budget",
             "spread_too_wide": "spread too wide",
             "missing_candles": "waiting for candle history",
             "missing_usd_proxy_candles": "waiting for USD proxy history",
             "paused_manual": "paused manually",
+            "size_exceeds_risk_budget": "size exceeds risk budget",
         }
         cleaned = mapping.get(reason, str(reason).replace("_", " "))
         return escape(cleaned)
@@ -388,15 +419,23 @@ class GoldTelegramClient:
             lines.append(balance_line)
         if unrealized is not None:
             lines.append(f"📉 Unrealized: {escape(self._format_currency(unrealized, currency))}")
-        if margin_used is not None:
-            lines.append(f"Margin used: {escape(self._format_currency(margin_used, currency))}")
-        if margin_available is not None:
-            lines.append(f"Margin available: {escape(self._format_currency(margin_available, currency))}")
         if budget_snapshot is not None:
-            lines.append(f"🛡️ Gold sleeve: {escape(self._format_currency(budget_snapshot.gold_sleeve_balance, currency))}")
-            lines.append(f"Gold reserved: {escape(self._format_currency(budget_snapshot.reserved_gold_risk, currency))}")
-            lines.append(f"FX reserved: {escape(self._format_currency(budget_snapshot.sibling_fx_reserved_risk, currency))}")
-            lines.append(f"Available gold risk: {escape(self._format_currency(budget_snapshot.available_gold_risk, currency))}")
+            lines.append("")
+            lines.append("🛡️ <b>Gold risk budget</b>")
+            lines.append(f"Sleeve: {escape(self._format_currency(budget_snapshot.gold_sleeve_balance, currency))} ({self.settings.gold_budget_allocation:.0%} of balance)")
+            lines.append(f"Max risk/trade: {escape(self._format_currency(budget_snapshot.max_trade_risk_amount, currency))}")
+            lines.append(f"Max total gold risk: {escape(self._format_currency(budget_snapshot.max_total_risk_amount, currency))}")
+            lines.append(f"Reserved by gold: {escape(self._format_currency(budget_snapshot.reserved_gold_risk, currency))}")
+            lines.append(f"Reserved by FX: {escape(self._format_currency(budget_snapshot.sibling_fx_reserved_risk, currency))}")
+            lines.append(f"Risk still available: {escape(self._format_currency(budget_snapshot.available_gold_risk, currency))}")
+        if margin_used is not None or margin_available is not None:
+            lines.append("")
+            lines.append("🏦 <b>Broker margin</b>")
+            if margin_used is not None:
+                lines.append(f"Used: {escape(self._format_currency(margin_used, currency))}")
+            if margin_available is not None:
+                lines.append(f"Available: {escape(self._format_currency(margin_available, currency))}")
+            lines.append("<i>Margin is OANDA collateral/exposure, not the Gold-bot budget.</i>")
         lines.extend(
             [
                 f"Open trades: {open_trade_count}",
@@ -418,12 +457,7 @@ class GoldTelegramClient:
             lines.append("")
             lines.append("📂 <b>Open trades</b>")
             for trade in open_trades:
-                opened_at = self._format_timestamp(trade.get("opened_at"))
-                lines.append(
-                    f"{self._direction_emoji(trade.get('direction'))} {escape(str(trade.get('strategy', 'TRADE')))} "
-                    f"{escape(str(trade.get('direction', '')))} | entry {escape(str(trade.get('entry_price', 'n/a')))} "
-                    f"| stop {escape(str(trade.get('stop_price', 'n/a')))} | opened {escape(opened_at)}"
-                )
+                lines.extend(self._format_trade_lines(trade, currency=currency, compact=True))
         return "\n".join(lines)
 
     def _build_last_signal_message(self, state: dict) -> str:
@@ -467,19 +501,10 @@ class GoldTelegramClient:
         if not open_trades:
             return "📂 <b>Open Gold Trades</b>\n━━━━━━━━━━━━━━━\nNo open gold trades."
         lines = ["📂 <b>Open Gold Trades</b>", "━━━━━━━━━━━━━━━"]
+        runtime = self._runtime_snapshot(state)
+        currency = runtime.get("account_currency") or state.get("account_currency") or "GBP"
         for trade in open_trades:
-            lines.append(
-                f"{self._direction_emoji(trade.get('direction'))} {escape(str(trade.get('strategy', 'TRADE')))} "
-                f"{escape(str(trade.get('direction', '')))}"
-            )
-            lines.append(
-                f"Entry {escape(str(trade.get('entry_price', 'n/a')))} | Stop {escape(str(trade.get('stop_price', 'n/a')))}"
-            )
-            lines.append(
-                f"Size {escape(str(trade.get('remaining_size', trade.get('size', 'n/a'))))} | "
-                f"Risk {escape(str(trade.get('risk_amount', 'n/a')))} | "
-                f"Opened {escape(self._format_timestamp(trade.get('opened_at')))}"
-            )
+            lines.extend(self._format_trade_lines(trade, currency=currency, compact=False))
         return "\n".join(lines)
 
     def _build_risk_message(self, state: dict) -> str:
@@ -503,8 +528,74 @@ class GoldTelegramClient:
             f"Tracked open risk: {escape(self._format_currency(open_risk, currency))}"
         )
 
+    @classmethod
+    def _format_trade_lines(cls, trade: dict, *, currency: str, compact: bool) -> list[str]:
+        strategy = escape(str(trade.get("strategy", "TRADE")))
+        direction = escape(str(trade.get("direction", "")))
+        instrument = escape(str(trade.get("instrument", "XAU_USD")))
+        size = trade.get("remaining_size", trade.get("size"))
+        entry = cls._format_price(trade.get("entry_price"))
+        stop = cls._format_price(trade.get("stop_price"))
+        initial_stop = cls._format_price(trade.get("initial_stop_price", trade.get("stop_price")))
+        risk_amount = trade.get("actual_risk_amount", trade.get("risk_amount"))
+        risk_per_unit = cls._to_float(trade.get("initial_risk_per_unit"))
+        exit_plan = dict(trade.get("exit_plan") or {})
+        partial_tp = exit_plan.get("partial_take_profit_price") or trade.get("take_profit_price")
+        break_even = exit_plan.get("break_even_trigger_price")
+        opened_at = cls._format_timestamp(trade.get("opened_at"))
+        lines = [
+            f"{cls._direction_emoji(trade.get('direction'))} <b>{strategy} {direction}</b> | {instrument}",
+            f"Entry {entry} | Size {cls._format_size(size)} units | Opened {escape(opened_at)}",
+            f"Stop {stop} | Initial stop {initial_stop} | Risk {escape(cls._format_currency(risk_amount, currency))}",
+        ]
+        if risk_per_unit is not None:
+            lines.append(f"Price risk: {risk_per_unit:.3f} pts/unit")
+        if partial_tp is not None or break_even is not None:
+            tp_text = cls._format_price(partial_tp) if partial_tp is not None else "n/a"
+            be_text = cls._format_price(break_even) if break_even is not None else "n/a"
+            lines.append(f"Partial TP: {tp_text} (50%) | Break-even trigger: {be_text}")
+        if not compact and exit_plan:
+            trail_timeframe = escape(str(exit_plan.get("trail_timeframe", "n/a")))
+            trail_distance = cls._format_price(exit_plan.get("trailing_stop_distance"))
+            lines.append(f"Runner: trailing stop after partial/BE | {trail_timeframe} trail distance {trail_distance}")
+        return lines
+
+    @classmethod
+    def _format_trade_opened_event(cls, event: dict) -> str | None:
+        details = event.get("details")
+        if not isinstance(details, dict):
+            return None
+        timestamp = cls._format_timestamp(event.get("timestamp"))
+        currency = str(details.get("account_currency") or "GBP")
+        mode = escape(str(details.get("mode", "n/a")).upper())
+        score = cls._format_score(details.get("score"))
+        lines = [
+            f"🟢 <b>Gold: Trade Opened</b> [{mode}]",
+            "━━━━━━━━━━━━━━━",
+            escape(timestamp),
+        ]
+        lines.extend(cls._format_trade_lines(details, currency=currency, compact=False))
+        if score != "n/a":
+            lines.append(f"Signal score: {score}")
+        lines.extend(
+            [
+                "",
+                "💷 <b>Budget / risk</b>",
+                f"Gold sleeve: {escape(cls._format_currency(details.get('gold_sleeve_balance'), currency))}",
+                f"Risk reserved: {escape(cls._format_currency(details.get('risk_amount'), currency))} / max trade {escape(cls._format_currency(details.get('max_trade_risk_amount'), currency))}",
+                f"Total gold risk after entry: {escape(cls._format_currency(details.get('reserved_gold_risk_after'), currency))} / max {escape(cls._format_currency(details.get('max_total_risk_amount'), currency))}",
+                f"Risk still available: {escape(cls._format_currency(details.get('available_gold_risk_after'), currency))}",
+                "<i>OANDA margin shown in /status is broker collateral/exposure, not this risk budget.</i>",
+            ]
+        )
+        return "\n".join(lines)
+
     @staticmethod
     def _format_event(event: dict) -> str:
+        if str(event.get("type", "")).lower() == "trade_opened":
+            formatted = GoldTelegramClient._format_trade_opened_event(event)
+            if formatted:
+                return formatted
         timestamp = GoldTelegramClient._format_timestamp(event.get("timestamp"))
         event_type = str(event.get("type", ""))
         emoji = GoldTelegramClient._event_emoji(event_type)
