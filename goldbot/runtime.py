@@ -1055,13 +1055,43 @@ class GoldBotRuntime:
 
         if (not trade.get("partial_taken")) and self._reached_level(trade["direction"], current_price, float(exit_plan["partial_take_profit_price"])):
             remaining = float(trade.get("remaining_size", trade["size"]))
-            partial_size = round(remaining * float(exit_plan.get("partial_take_profit_fraction", 0.5)), 2)
-            if partial_size < 0.01:
-                partial_size = remaining  # close all if remainder too small
-            if self.client.close_trade(str(trade["id"]), size=partial_size):
+            fraction = float(exit_plan.get("partial_take_profit_fraction", 0.5))
+            # OANDA XAU_USD trades are denominated in integer units. Snap the
+            # partial-close size to a positive integer that does not exceed the
+            # remaining position; otherwise OANDA rejects the close with
+            # 400 Bad Request (e.g. units=0 on a 1-unit trade where 50% rounds
+            # down to 0). Without this guard the failed close keeps retrying
+            # every cycle because partial_taken is never set.
+            remaining_units = int(round(remaining))
+            partial_units = int(round(remaining * fraction))
+            if remaining_units <= 1 or partial_units < 1:
+                # Position too small to scale out. Mark partial_taken so the
+                # break-even / trailing-stop logic below can take over and we
+                # do not retry the broken partial-close every cycle.
                 trade["partial_taken"] = True
-                trade["remaining_size"] = max(0.0, float(trade.get("remaining_size", trade["size"])) - partial_size)
-                self._record_event(state, "partial_profit", f"Trade {trade['id']} took partial profit, remaining size {trade['remaining_size']}", now=datetime.now(timezone.utc))
+                self._record_event(
+                    state,
+                    "partial_skipped",
+                    f"Trade {trade['id']} partial profit skipped (remaining size {remaining_units} too small to scale out)",
+                    now=datetime.now(timezone.utc),
+                )
+            elif partial_units >= remaining_units:
+                # Snap to a full close instead of asking OANDA to close more
+                # than the trade currently holds.
+                if self.client.close_trade(str(trade["id"])):
+                    trade["partial_taken"] = True
+                    trade["remaining_size"] = 0.0
+                    self._record_event(
+                        state,
+                        "partial_profit",
+                        f"Trade {trade['id']} closed in full at partial-profit target (size {remaining_units} too small to scale out)",
+                        now=datetime.now(timezone.utc),
+                    )
+            else:
+                if self.client.close_trade(str(trade["id"]), size=partial_units):
+                    trade["partial_taken"] = True
+                    trade["remaining_size"] = max(0.0, remaining - partial_units)
+                    self._record_event(state, "partial_profit", f"Trade {trade['id']} took partial profit, remaining size {trade['remaining_size']}", now=datetime.now(timezone.utc))
 
         if (not trade.get("break_even_moved")) and exit_plan.get("break_even_trigger_price") is not None and self._reached_level(trade["direction"], current_price, float(exit_plan["break_even_trigger_price"])):
             if self._tighten_stop(trade, float(trade["entry_price"])):

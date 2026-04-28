@@ -267,7 +267,18 @@ class OandaClient:
             return True
         payload: dict[str, str] = {}
         if size is not None:
-            payload["units"] = str(int(round(abs(size))))
+            units = int(round(abs(float(size))))
+            if units <= 0:
+                # Defensive guard: OANDA rejects units=0 with 400 Bad Request,
+                # which would otherwise loop forever once a partial-close is
+                # triggered on a sub-rounding-threshold size.
+                log.warning(
+                    "close_trade(%s) ignored: requested size %r rounds to 0 units",
+                    trade_id,
+                    size,
+                )
+                return False
+            payload["units"] = str(units)
         response = self._put(
             f"/v3/accounts/{self.settings.oanda_account_id}/trades/{trade_id}/close",
             payload,

@@ -67,6 +67,75 @@ def test_manage_open_trade_moves_break_even_and_partial(tmp_path, monkeypatch) -
     assert trade["stop_price"] >= 3000.0
 
 
+def test_manage_open_trade_skips_partial_when_size_too_small(tmp_path, monkeypatch) -> None:
+    """A 1-unit XAU position cannot be scaled out by 50% (rounds to 0 units,
+    which OANDA rejects with 400 Bad Request). Ensure we mark partial_taken
+    and skip the close so the failure does not loop every cycle."""
+
+    _disable_redis(monkeypatch)
+    runtime = GoldBotRuntime()
+    runtime.state_path = tmp_path / "state.json"
+
+    state = {
+        "signals": [],
+        "open_trades": [
+            {
+                "id": "paper-1",
+                "instrument": "XAU_USD",
+                "strategy": "TREND_PULLBACK",
+                "direction": "LONG",
+                "entry_price": 3000.0,
+                "stop_price": 2995.0,
+                "initial_stop_price": 2995.0,
+                "initial_risk_per_unit": 5.0,
+                "size": 1.0,
+                "remaining_size": 1.0,
+                "risk_amount": 10.0,
+                "partial_taken": False,
+                "break_even_moved": False,
+                "exit_plan": {
+                    "partial_take_profit_fraction": 0.5,
+                    "partial_take_profit_price": 3005.0,
+                    "break_even_trigger_price": 3005.0,
+                    "trail_timeframe": "H1",
+                    "trail_ema_period": 20,
+                    "trail_atr_mult": 2.2,
+                    "trailing_stop_distance": 3.0,
+                },
+                "opened_at": datetime.now(timezone.utc).isoformat(),
+            }
+        ],
+    }
+    runtime._save_state(state)
+
+    close_calls: list[dict] = []
+
+    def _record_close(trade_id, size=None):  # pragma: no cover - simple stub
+        close_calls.append({"trade_id": trade_id, "size": size})
+        return True
+
+    monkeypatch.setattr(runtime.client, "get_price", lambda instrument: {"bid": 3008.0, "ask": 3008.2, "mid": 3008.1, "spread": 0.2})
+    monkeypatch.setattr(runtime.client, "close_trade", _record_close)
+    monkeypatch.setattr(runtime.client, "modify_trade", lambda trade_id, stop_price=None: True)
+    monkeypatch.setattr(
+        runtime.client,
+        "fetch_candles",
+        lambda instrument, granularity, count: __import__("pandas").DataFrame(
+            [{"close": 3000.0 + index * 0.5, "high": 3001.0 + index * 0.5, "low": 2999.0 + index * 0.5, "open": 3000.0 + index * 0.5, "volume": 100} for index in range(40)]
+        ),
+    )
+
+    loaded = runtime._load_state()
+    runtime._manage_open_trades(loaded)
+    updated = runtime._load_state()
+    trade = updated["open_trades"][0]
+
+    assert trade["partial_taken"] is True
+    assert trade["remaining_size"] == 1.0
+    assert close_calls == []
+    assert any(event["type"] == "partial_skipped" for event in updated.get("events", []))
+
+
 def test_run_cycle_skips_new_entry_when_state_trade_exists(tmp_path, monkeypatch) -> None:
     _disable_redis(monkeypatch)
     runtime = GoldBotRuntime()
