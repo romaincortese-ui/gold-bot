@@ -345,8 +345,8 @@ def test_status_message_separates_margin_from_gold_risk_budget(tmp_path, monkeyp
     )
 
     assert "🛡️ <b>Gold risk budget</b>" in message
-    assert "Sleeve: GBP95.95" in message
-    assert "Reserved by gold: GBP0.72" in message
+    assert "Account: GBP95.95" in message
+    assert "Reserved: GBP0.72" in message
     assert "🏦 <b>Broker margin</b>" in message
     assert "Used: GBP173.31" in message
     assert "not the Gold-bot budget" in message

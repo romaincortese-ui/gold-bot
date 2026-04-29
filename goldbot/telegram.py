@@ -181,7 +181,7 @@ class GoldTelegramClient:
             "/last - Latest signal snapshot\n"
             "/events - Recent runtime events\n"
             "/open - Open trade details\n"
-            "/risk - Gold sleeve risk snapshot\n"
+            "/risk - Gold risk snapshot\n"
             "/pause - Queue a pause request\n"
             "/resume - Queue a resume request\n"
             "/sync - Queue a broker sync\n"
@@ -422,11 +422,10 @@ class GoldTelegramClient:
         if budget_snapshot is not None:
             lines.append("")
             lines.append("🛡️ <b>Gold risk budget</b>")
-            lines.append(f"Sleeve: {escape(self._format_currency(budget_snapshot.gold_sleeve_balance, currency))} ({self.settings.gold_budget_allocation:.0%} of balance)")
+            lines.append(f"Account: {escape(self._format_currency(budget_snapshot.gold_sleeve_balance, currency))}")
             lines.append(f"Max risk/trade: {escape(self._format_currency(budget_snapshot.max_trade_risk_amount, currency))}")
             lines.append(f"Max total gold risk: {escape(self._format_currency(budget_snapshot.max_total_risk_amount, currency))}")
-            lines.append(f"Reserved by gold: {escape(self._format_currency(budget_snapshot.reserved_gold_risk, currency))}")
-            lines.append(f"Reserved by FX: {escape(self._format_currency(budget_snapshot.sibling_fx_reserved_risk, currency))}")
+            lines.append(f"Reserved: {escape(self._format_currency(budget_snapshot.reserved_gold_risk, currency))}")
             lines.append(f"Risk still available: {escape(self._format_currency(budget_snapshot.available_gold_risk, currency))}")
         if margin_used is not None or margin_available is not None:
             lines.append("")
@@ -519,12 +518,10 @@ class GoldTelegramClient:
             "🛡️ <b>Gold Risk</b>\n"
             "━━━━━━━━━━━━━━━\n"
             f"Balance: {escape(self._format_currency(snapshot.account_balance, currency))}\n"
-            f"Gold sleeve: {escape(self._format_currency(snapshot.gold_sleeve_balance, currency))}\n"
             f"Max per trade: {escape(self._format_currency(snapshot.max_trade_risk_amount, currency))}\n"
             f"Max total: {escape(self._format_currency(snapshot.max_total_risk_amount, currency))}\n"
-            f"Gold reserved: {escape(self._format_currency(snapshot.reserved_gold_risk, currency))}\n"
-            f"FX reserved: {escape(self._format_currency(snapshot.sibling_fx_reserved_risk, currency))}\n"
-            f"Available gold risk: {escape(self._format_currency(snapshot.available_gold_risk, currency))}\n"
+            f"Reserved: {escape(self._format_currency(snapshot.reserved_gold_risk, currency))}\n"
+            f"Available: {escape(self._format_currency(snapshot.available_gold_risk, currency))}\n"
             f"Tracked open risk: {escape(self._format_currency(open_risk, currency))}"
         )
 
@@ -581,7 +578,7 @@ class GoldTelegramClient:
             [
                 "",
                 "💷 <b>Budget / risk</b>",
-                f"Gold sleeve: {escape(cls._format_currency(details.get('gold_sleeve_balance'), currency))}",
+                f"Account: {escape(cls._format_currency(details.get('gold_sleeve_balance'), currency))}",
                 f"Risk reserved: {escape(cls._format_currency(details.get('risk_amount'), currency))} / max trade {escape(cls._format_currency(details.get('max_trade_risk_amount'), currency))}",
                 f"Total gold risk after entry: {escape(cls._format_currency(details.get('reserved_gold_risk_after'), currency))} / max {escape(cls._format_currency(details.get('max_total_risk_amount'), currency))}",
                 f"Risk still available: {escape(cls._format_currency(details.get('available_gold_risk_after'), currency))}",

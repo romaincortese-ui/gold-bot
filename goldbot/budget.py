@@ -17,7 +17,11 @@ class SharedBudgetManager:
         payload = self._load()
         bots = payload.get("bots", {})
         gold_reserved = float(bots.get("gold", {}).get("reserved_risk", 0.0) or 0.0)
-        fx_reserved = float(bots.get("fx", {}).get("reserved_risk", 0.0) or 0.0)
+        # Accounts are separated per-bot (Gold-bot and FX-bot run on dedicated
+        # OANDA sub-accounts). Sibling reserved-risk is therefore 0 by
+        # definition — the FX bot's positions cannot consume Gold-bot account
+        # margin.
+        fx_reserved = 0.0
         gold_sleeve_balance = account_balance * self.settings.gold_budget_allocation
         max_trade_risk_amount = gold_sleeve_balance * self.settings.max_risk_per_trade
         max_total_risk_amount = gold_sleeve_balance * self.settings.max_total_gold_risk
