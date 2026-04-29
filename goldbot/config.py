@@ -541,8 +541,10 @@ def resolve_path(path_text: str) -> Path:
 def _validate_settings(settings: Settings) -> None:
     if settings.instrument != "XAU_USD":
         raise ValueError("Gold-bot only supports XAU_USD")
-    if abs((settings.gold_budget_allocation + settings.fx_budget_allocation) - 1.0) > 0.001:
-        raise ValueError("GOLD_BUDGET_ALLOCATION and FX_BUDGET_ALLOCATION must sum to 1.0")
+    if not 0.0 <= settings.gold_budget_allocation <= 1.0:
+        raise ValueError("GOLD_BUDGET_ALLOCATION must be between 0.0 and 1.0")
+    if not 0.0 <= settings.fx_budget_allocation <= 1.0:
+        raise ValueError("FX_BUDGET_ALLOCATION must be between 0.0 and 1.0")
     if settings.execution_mode not in {"signal_only", "paper", "live"}:
         raise ValueError("EXECUTION_MODE must be signal_only, paper, or live")
     if settings.max_total_gold_risk < settings.max_risk_per_trade:

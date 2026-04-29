@@ -1,10 +1,10 @@
 import pytest
 
-from goldbot.config import Settings, _validate_settings
+from goldbot.config import Settings, _validate_settings, load_settings
 
 
-def test_validate_settings_rejects_non_gold_instrument() -> None:
-    settings = Settings(
+def _settings(**overrides) -> Settings:
+    values = dict(
         instrument="EUR_USD",
         oanda_api_key="",
         oanda_account_id="",
@@ -62,5 +62,51 @@ def test_validate_settings_rejects_non_gold_instrument() -> None:
         news_cache_file="cache.json",
         news_urls=["https://example.com"],
     )
+    values.update(overrides)
+    return Settings(**values)
+
+
+def test_validate_settings_rejects_non_gold_instrument() -> None:
+    settings = _settings(instrument="EUR_USD")
     with pytest.raises(ValueError):
         _validate_settings(settings)
+
+
+def test_validate_settings_accepts_independent_account_allocations() -> None:
+    settings = _settings(
+        instrument="XAU_USD",
+        gold_budget_allocation=1.0,
+        fx_budget_allocation=1.0,
+    )
+
+    _validate_settings(settings)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("gold_budget_allocation", -0.01, "GOLD_BUDGET_ALLOCATION"),
+        ("gold_budget_allocation", 1.01, "GOLD_BUDGET_ALLOCATION"),
+        ("fx_budget_allocation", -0.01, "FX_BUDGET_ALLOCATION"),
+        ("fx_budget_allocation", 1.01, "FX_BUDGET_ALLOCATION"),
+    ],
+)
+def test_validate_settings_rejects_per_bot_allocation_outside_unit_interval(
+    field: str,
+    value: float,
+    message: str,
+) -> None:
+    settings = _settings(instrument="XAU_USD", **{field: value})
+
+    with pytest.raises(ValueError, match=message):
+        _validate_settings(settings)
+
+
+def test_load_settings_defaults_to_independent_full_account_allocations(monkeypatch) -> None:
+    monkeypatch.delenv("GOLD_BUDGET_ALLOCATION", raising=False)
+    monkeypatch.delenv("FX_BUDGET_ALLOCATION", raising=False)
+
+    settings = load_settings()
+
+    assert settings.gold_budget_allocation == 1.0
+    assert settings.fx_budget_allocation == 1.0

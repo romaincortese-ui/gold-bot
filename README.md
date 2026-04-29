@@ -1,6 +1,6 @@
 # Gold-bot
 
-Gold-bot is a dedicated XAU/USD bot for the same OANDA account used by the FX bot, but with its own capital sleeve and strategy set. The structure is intentionally similar to the FX-bot layout: thin entrypoints, a runtime orchestrator, small pure helper modules, and strategy logic separated from market access.
+Gold-bot is a dedicated XAU/USD bot intended to run against its own OANDA sub-account, with its own risk budget and strategy set. The structure is intentionally similar to the FX-bot layout: thin entrypoints, a runtime orchestrator, small pure helper modules, and strategy logic separated from market access.
 
 ## Architecture
 
@@ -12,7 +12,7 @@ Gold-bot is a dedicated XAU/USD bot for the same OANDA account used by the FX bo
 - `goldbot/telegram.py`: Telegram polling client embedded inside the live worker for runtime alerts and commands
 - `goldbot/indicators.py`: EMA, RSI, MACD, ATR, divergence, candlestick helpers, consolidation boxes
 - `goldbot/strategies.py`: three XAU/USD strategy evaluators
-- `goldbot/budget.py`: shared-sleeve budget tracking with 50% FX / 50% Gold allocation
+- `goldbot/budget.py`: Gold risk-budget tracking for the dedicated account
 - `goldbot/runtime.py`: session filters, strategy selection, sizing, and execution
 - `goldbot/backtest_config.py`: historical backtest window and artifact settings
 - `goldbot/backtest_data.py`: OANDA historical candle loading with local cache files
@@ -36,8 +36,8 @@ The bot trades only `XAU_USD` and uses three low-frequency gold playbooks:
 
 ## Risk Model
 
-- Capital allocation is split `50% FX / 50% Gold` at the account level.
-- Gold-bot sizes risk off the gold sleeve, not the whole account.
+- Gold-bot sizes risk off the dedicated OANDA account balance it sees.
+- `GOLD_BUDGET_ALLOCATION` remains as a per-service safety knob in `[0, 1]`, defaulting to `1.00` for a separated account.
 - Position sizing is ATR-aware because XAU/USD volatility is unstable across sessions and macro regimes.
 - Entry execution is blocked when the live XAU/USD spread is wider than `MAX_ENTRY_SPREAD` so the bot does not enter into distorted post-news pricing.
 - Macro breakout entries can wait for live spread stabilization before firing, which is meant to avoid the worst post-news OANDA spread blowouts instead of chasing the first quote spike.
@@ -74,8 +74,8 @@ Core:
 
 Budget and risk:
 
-- `GOLD_BUDGET_ALLOCATION=0.50`
-- `FX_BUDGET_ALLOCATION=0.50`
+- `GOLD_BUDGET_ALLOCATION=1.00`
+- `FX_BUDGET_ALLOCATION=1.00`
 - `MAX_RISK_PER_TRADE=0.0075`
 - `MAX_TOTAL_GOLD_RISK=0.03`
 - `MAX_OPEN_GOLD_TRADES=1`
