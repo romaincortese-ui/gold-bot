@@ -60,3 +60,56 @@ def test_load_runtime_status_rejects_stale_file_payload(tmp_path, monkeypatch) -
     payload = shared_backend.load_runtime_status(None, str(target), max_age_seconds=60)
 
     assert payload is None
+
+
+class WorkingRedisClient:
+    def ping(self):
+        return True
+
+
+class FakeRedisModule:
+    class WatchError(Exception):
+        pass
+
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+
+    def from_url(self, url, **kwargs):
+        self.urls.append(url)
+        if "private" in url:
+            raise TimeoutError("private endpoint timeout")
+        return WorkingRedisClient()
+
+
+def test_get_redis_client_prefers_public_proxy_and_caches_client(monkeypatch) -> None:
+    fake_redis = FakeRedisModule()
+    monkeypatch.setattr(shared_backend, "redis", fake_redis)
+    monkeypatch.setattr(shared_backend, "_redis_client", None)
+    monkeypatch.setattr(shared_backend, "_redis_url", None)
+    shared_backend._redis_failed_until.clear()
+    monkeypatch.setenv("REDIS_URL", "redis://private:6379")
+    monkeypatch.setenv("REDIS_PUBLIC_URL", "redis://public:42277")
+    monkeypatch.setenv("GOLD_REDIS_PREFER_PUBLIC", "true")
+
+    client = shared_backend.get_redis_client()
+    cached = shared_backend.get_redis_client()
+
+    assert isinstance(client, WorkingRedisClient)
+    assert cached is client
+    assert fake_redis.urls == ["redis://public:42277"]
+
+
+def test_get_redis_client_cools_down_failed_private_endpoint(monkeypatch) -> None:
+    fake_redis = FakeRedisModule()
+    monkeypatch.setattr(shared_backend, "redis", fake_redis)
+    monkeypatch.setattr(shared_backend, "_redis_client", None)
+    monkeypatch.setattr(shared_backend, "_redis_url", None)
+    shared_backend._redis_failed_until.clear()
+    monkeypatch.setenv("REDIS_URL", "redis://private:6379")
+    monkeypatch.delenv("REDIS_PUBLIC_URL", raising=False)
+    monkeypatch.setenv("GOLD_REDIS_FAILED_URL_COOLDOWN_SECONDS", "60")
+
+    assert shared_backend.get_redis_client(_retries=1, _delay=0) is None
+    assert shared_backend.get_redis_client(_retries=1, _delay=0) is None
+
+    assert fake_redis.urls == ["redis://private:6379"]

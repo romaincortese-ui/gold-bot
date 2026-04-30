@@ -8,6 +8,7 @@ from goldbot.config import load_settings
 from goldbot.news import fetch_calendar_events, filter_gold_events
 from goldbot.real_yields import build_real_yield_signal, fetch_real_yield_history, signal_to_payload
 from goldbot.cftc import signal_to_payload as cftc_signal_to_payload  # re-exported for downstream pipelines  # noqa: F401
+from goldbot.shared_backend import save_json_payload
 
 
 logging.basicConfig(
@@ -45,6 +46,11 @@ def main() -> None:
     output_path = Path(settings.macro_state_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    if settings.gold_event_state_file != settings.macro_state_file:
+        event_path = Path(settings.gold_event_state_file)
+        event_path.parent.mkdir(parents=True, exist_ok=True)
+        event_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    save_json_payload(settings.gold_event_state_file, payload, settings.gold_event_redis_key)
     log.info("Wrote %s relevant gold events to %s", len(relevant), output_path)
 
 

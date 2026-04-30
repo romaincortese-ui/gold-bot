@@ -111,6 +111,16 @@ class Settings:
     macro_state_file: str
     news_cache_file: str
     news_urls: list[str]
+    gold_event_policy_enabled: bool = True
+    gold_event_redis_key: str = "gold:event_intelligence"
+    gold_event_state_file: str = "gold_macro_state.json"
+    gold_event_refresh_seconds: int = 300
+    gold_event_stale_seconds: int = 7200
+    gold_event_high_impact_window_minutes: int = 180
+    gold_event_extreme_window_minutes: int = 30
+    gold_event_adverse_risk_multiplier: float = 0.5
+    gold_event_favourable_risk_multiplier: float = 1.15
+    gold_event_score_offset: float = 4.0
     breakout_volume_mode: str = "tick"
     breakout_external_volume_file: str = ""
     breakout_external_volume_max_age_minutes: int = 30
@@ -391,6 +401,16 @@ def load_settings() -> Settings:
             "GOLD_NEWS_URLS",
             "https://nfs.faireconomy.media/ff_calendar_thisweek.xml,https://www.forexfactory.com/ffcal_week_this.xml",
         ),
+        gold_event_policy_enabled=env_bool("GOLD_EVENT_POLICY_ENABLED", True),
+        gold_event_redis_key=env_str("GOLD_EVENT_REDIS_KEY", "gold:event_intelligence"),
+        gold_event_state_file=env_str("GOLD_EVENT_STATE_FILE", env_str("GOLD_MACRO_STATE_FILE", "gold_macro_state.json")),
+        gold_event_refresh_seconds=env_int("GOLD_EVENT_REFRESH_SECONDS", 300),
+        gold_event_stale_seconds=env_int("GOLD_EVENT_STALE_SECONDS", 7200),
+        gold_event_high_impact_window_minutes=env_int("GOLD_EVENT_HIGH_IMPACT_WINDOW_MINUTES", 180),
+        gold_event_extreme_window_minutes=env_int("GOLD_EVENT_EXTREME_WINDOW_MINUTES", 30),
+        gold_event_adverse_risk_multiplier=env_float("GOLD_EVENT_ADVERSE_RISK_MULTIPLIER", 0.5),
+        gold_event_favourable_risk_multiplier=env_float("GOLD_EVENT_FAVOURABLE_RISK_MULTIPLIER", 1.15),
+        gold_event_score_offset=env_float("GOLD_EVENT_SCORE_OFFSET", 4.0),
         breakout_volume_mode=env_str("BREAKOUT_VOLUME_MODE", "tick").lower(),
         breakout_external_volume_file=env_str("BREAKOUT_EXTERNAL_VOLUME_FILE", ""),
         breakout_external_volume_max_age_minutes=env_int("BREAKOUT_EXTERNAL_VOLUME_MAX_AGE_MINUTES", 30),
@@ -618,6 +638,22 @@ def _validate_settings(settings: Settings) -> None:
         raise ValueError("BREAKOUT_IMPULSE_BODY_ATR_MIN must be > 0")
     if not (0.0 <= settings.news_surprise_min_composite <= 1.0):
         raise ValueError("NEWS_SURPRISE_MIN_COMPOSITE must be in [0, 1]")
+    if settings.gold_event_refresh_seconds < 1:
+        raise ValueError("GOLD_EVENT_REFRESH_SECONDS must be >= 1")
+    if settings.gold_event_stale_seconds < settings.gold_event_refresh_seconds:
+        raise ValueError("GOLD_EVENT_STALE_SECONDS must be >= GOLD_EVENT_REFRESH_SECONDS")
+    if settings.gold_event_high_impact_window_minutes < 0:
+        raise ValueError("GOLD_EVENT_HIGH_IMPACT_WINDOW_MINUTES must be >= 0")
+    if settings.gold_event_extreme_window_minutes < 0:
+        raise ValueError("GOLD_EVENT_EXTREME_WINDOW_MINUTES must be >= 0")
+    if settings.gold_event_extreme_window_minutes > settings.gold_event_high_impact_window_minutes:
+        raise ValueError("GOLD_EVENT_EXTREME_WINDOW_MINUTES must be <= GOLD_EVENT_HIGH_IMPACT_WINDOW_MINUTES")
+    if not (0.0 < settings.gold_event_adverse_risk_multiplier <= 1.0):
+        raise ValueError("GOLD_EVENT_ADVERSE_RISK_MULTIPLIER must be in (0, 1]")
+    if not (1.0 <= settings.gold_event_favourable_risk_multiplier <= 1.5):
+        raise ValueError("GOLD_EVENT_FAVOURABLE_RISK_MULTIPLIER must be in [1, 1.5]")
+    if settings.gold_event_score_offset < 0:
+        raise ValueError("GOLD_EVENT_SCORE_OFFSET must be >= 0")
     if settings.drawdown_soft_window_days <= 0 or settings.drawdown_hard_window_days <= 0:
         raise ValueError("Drawdown windows must be > 0")
     if settings.drawdown_soft_threshold_pct >= 0 or settings.drawdown_hard_threshold_pct >= 0:

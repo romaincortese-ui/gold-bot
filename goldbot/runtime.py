@@ -22,6 +22,7 @@ from goldbot.calibration import (
     validate_calibration,
 )
 from goldbot.config import load_settings
+from goldbot.event_policy import apply_gold_event_policy
 from goldbot.marketdata import OandaClient, SpreadTooWideError
 from goldbot.models import Opportunity
 from goldbot.news import fetch_calendar_events, filter_gold_events
@@ -90,6 +91,8 @@ class GoldBotRuntime:
         self.calibration_file = os.getenv("GOLD_CALIBRATION_FILE", CALIBRATION_FILE).strip()
         self.calibration_redis_key = os.getenv("GOLD_CALIBRATION_REDIS_KEY", CALIBRATION_REDIS_KEY).strip()
         self.calibration: dict | None = None
+        self._gold_event_state: dict | None = None
+        self._last_gold_event_refresh_at = 0.0
         self.telegram_client = self._build_telegram_client()
         # Sprint 1: rolling-median spread tracker fed by every quote fetch.
         self._spread_tracker = SpreadTracker(
@@ -352,6 +355,7 @@ class GoldBotRuntime:
             now=now,
             max_age_minutes=self.settings.news_score_state_max_age_minutes,
         )
+        gold_event_state = self._refresh_gold_event_state()
 
         self._refresh_calibration()
 
@@ -451,6 +455,20 @@ class GoldBotRuntime:
                 # Sprint 3 §3.1: co-trade gates can still veto an opportunity.
                 if filtered is not None:
                     filtered = apply_co_trade_gates(self.settings, filtered, co_trade_signal)
+                if filtered is not None:
+                    filtered, event_decision = apply_gold_event_policy(self.settings, filtered, gold_event_state, now)
+                    if filtered is None:
+                        rejection_reasons.append(f"gold_event_policy:{event_decision.reason}")
+                    elif event_decision.reason not in {"disabled", "no_fresh_event_state", "neutral"}:
+                        log.info(
+                            "Gold event policy %s for %s %s (bias=%.2f risk_mult=%.2f events=%d)",
+                            event_decision.reason,
+                            filtered.strategy,
+                            filtered.direction,
+                            event_decision.gold_bias_score,
+                            event_decision.risk_multiplier,
+                            event_decision.event_count,
+                        )
                 if filtered is not None:
                     calibrated.append(filtered)
 
@@ -654,6 +672,28 @@ class GoldBotRuntime:
         self._save_state(state)
         self._publish_runtime_status("trade_opened", state, balance=balance)
         return result
+
+    def _refresh_gold_event_state(self) -> dict | None:
+        if not getattr(self.settings, "gold_event_policy_enabled", True):
+            return None
+        now_monotonic = time.monotonic()
+        if (
+            self._gold_event_state is not None
+            and now_monotonic - self._last_gold_event_refresh_at < self.settings.gold_event_refresh_seconds
+        ):
+            return self._gold_event_state
+        self._last_gold_event_refresh_at = now_monotonic
+        try:
+            payload = load_json_payload(
+                self.settings.gold_event_state_file,
+                self.settings.gold_event_redis_key,
+                {},
+            )
+        except Exception:
+            log.exception("Failed to refresh gold event state")
+            return self._gold_event_state
+        self._gold_event_state = payload if isinstance(payload, dict) and payload else None
+        return self._gold_event_state
 
     def _evaluate_drawdown_kill_switch(self, state: dict, now: datetime):
         """Maintain equity history in state and evaluate the kill switch.

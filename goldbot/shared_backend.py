@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -15,6 +16,7 @@ log = logging.getLogger(__name__)
 
 _redis_client = None
 _redis_url = None
+_redis_failed_until: dict[str, float] = {}
 
 
 def _invalidate_redis_client() -> None:
@@ -23,42 +25,72 @@ def _invalidate_redis_client() -> None:
     _redis_url = None
 
 
-def get_redis_client(*, _retries: int = 3, _delay: float = 2.0):
+def get_redis_client(*, _retries: int = 1, _delay: float = 0.5):
     global _redis_client, _redis_url
-    # Try REDIS_URL first, fall back to REDIS_PUBLIC_URL (TCP proxy, no Wireguard)
-    urls_to_try = []
-    for var in ("REDIS_URL", "REDIS_PUBLIC_URL"):
-        url = os.getenv(var, "").strip()
-        if url and url not in urls_to_try:
-            urls_to_try.append(url)
+    urls_to_try = _redis_urls_to_try()
     if not urls_to_try or redis is None:
         return None
-    # Return cached client if still valid
     if _redis_client is not None and _redis_url in urls_to_try:
         return _redis_client
-    import logging as _logging
-    import time as _time
-    log = _logging.getLogger(__name__)
+
+    now = time.monotonic()
+    cooldown = max(0.0, float(os.getenv("GOLD_REDIS_FAILED_URL_COOLDOWN_SECONDS", "900") or 900))
+    connect_timeout = max(0.2, float(os.getenv("GOLD_REDIS_CONNECT_TIMEOUT_SECONDS", "2") or 2))
+    retries = max(1, int(os.getenv("GOLD_REDIS_CONNECT_RETRIES", str(_retries)) or _retries))
     for redis_url in urls_to_try:
-        for attempt in range(1, _retries + 1):
+        if _redis_failed_until.get(redis_url, 0.0) > now:
+            continue
+        for attempt in range(1, retries + 1):
             try:
                 _redis_client = redis.from_url(
                     redis_url,
-                    socket_connect_timeout=5,
-                    socket_timeout=5,
+                    socket_connect_timeout=connect_timeout,
+                    socket_timeout=connect_timeout,
                     health_check_interval=30,
                     retry_on_timeout=True,
                 )
                 _redis_client.ping()
                 _redis_url = redis_url
-                log.info("Redis connected via %s", redis_url.split("@")[-1] if "@" in redis_url else redis_url.split("//")[-1])
+                _redis_failed_until.pop(redis_url, None)
+                log.info("Redis connected via %s", _redis_url_label(redis_url))
                 return _redis_client
             except Exception as exc:
-                log.warning("Redis connection attempt %d/%d failed (%s): %s", attempt, _retries, redis_url.split("@")[-1] if "@" in redis_url else redis_url.split("//")[-1], exc)
                 _invalidate_redis_client()
-                if attempt < _retries:
-                    _time.sleep(_delay * attempt)
+                if attempt >= retries:
+                    _redis_failed_until[redis_url] = time.monotonic() + cooldown
+                    log.warning(
+                        "Redis connection failed (%s); suppressing retries for %.0fs: %s",
+                        _redis_url_label(redis_url),
+                        cooldown,
+                        exc,
+                    )
+                elif _delay > 0:
+                    time.sleep(_delay * attempt)
     return None
+
+
+def _redis_urls_to_try() -> list[str]:
+    urls: list[str] = []
+    preferred = "REDIS_PUBLIC_URL" if env_bool("GOLD_REDIS_PREFER_PUBLIC", True) else "REDIS_URL"
+    for var in (preferred, "REDIS_URL", "REDIS_PUBLIC_URL"):
+        url = os.getenv(var, "").strip()
+        if url and url not in urls:
+            urls.append(url)
+    if _redis_url in urls:
+        urls.remove(_redis_url)
+        urls.insert(0, _redis_url)
+    return urls
+
+
+def _redis_url_label(redis_url: str) -> str:
+    return redis_url.split("@")[-1] if "@" in redis_url else redis_url.split("//")[-1]
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def load_json_payload(file_path: str, redis_key: str | None = None, default: dict | None = None) -> dict:

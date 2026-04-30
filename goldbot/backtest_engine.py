@@ -23,6 +23,7 @@ from goldbot.marketdata import OandaClient
 from goldbot.models import CalendarEvent, Opportunity
 from goldbot.backtest_reporter import build_report
 from goldbot.real_yields import apply_real_yield_overlay, build_real_yield_signal, fetch_real_yield_history
+from goldbot.event_policy import apply_gold_event_policy
 from goldbot.strategies import (
     score_exhaustion_reversal,
     score_macro_breakout,
@@ -222,15 +223,35 @@ class GoldBacktestEngine:
             score_trend_pullback(self.settings, df_h1, df_h4, usd_h4),
         ]
         real_yield_signal = build_real_yield_signal(real_yield_frame, timestamp, self.settings.real_yield_lookback_days)
-        return select_best_opportunity(
-            [
-                filtered
-                for item in opportunities
-                if item is not None
-                for filtered in [apply_real_yield_overlay(self.settings, item, real_yield_signal)]
-                if filtered is not None
-            ]
-        )
+        event_state = self._event_state_at_time(timestamp, events)
+        filtered_opportunities: list[Opportunity] = []
+        for item in opportunities:
+            if item is None:
+                continue
+            filtered = apply_real_yield_overlay(self.settings, item, real_yield_signal)
+            if filtered is None:
+                continue
+            filtered, _event_decision = apply_gold_event_policy(self.settings, filtered, event_state, timestamp)
+            if filtered is not None:
+                filtered_opportunities.append(filtered)
+        return select_best_opportunity(filtered_opportunities)
+
+    @staticmethod
+    def _event_state_at_time(timestamp: datetime, events: list[CalendarEvent]) -> dict[str, Any]:
+        return {
+            "generated_at": timestamp.astimezone(timezone.utc).isoformat(),
+            "instrument": "XAU_USD",
+            "events": [
+                {
+                    "title": event.title,
+                    "currency": event.currency,
+                    "impact": event.impact,
+                    "occurs_at": event.occurs_at.isoformat(),
+                    "source": event.source,
+                }
+                for event in events
+            ],
+        }
 
     def _load_real_yield_frame(self) -> pd.DataFrame | None:
         if not self.settings.real_yield_filter_enabled:
