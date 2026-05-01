@@ -111,6 +111,17 @@ class Settings:
     macro_state_file: str
     news_cache_file: str
     news_urls: list[str]
+    missed_opportunities_enabled: bool = True
+    missed_opportunities_file: str = "missed_opportunities.json"
+    missed_opportunities_max_records: int = 300
+    missed_opportunity_horizons_hours: str = "1,4,24"
+    breakout_range_expansion_enabled: bool = True
+    breakout_range_expansion_max_box_atr_ratio: float = 5.0
+    breakout_range_expansion_body_atr_min: float = 0.80
+    breakout_range_expansion_stop_atr: float = 1.35
+    trend_deep_pullback_enabled: bool = False
+    trend_deep_pullback_atr_tolerance: float = 1.35
+    trend_deep_pullback_min_strength_atr: float = 1.40
     gold_event_policy_enabled: bool = True
     gold_event_redis_key: str = "gold:event_intelligence"
     gold_event_state_file: str = "gold_macro_state.json"
@@ -202,6 +213,7 @@ class Settings:
     # candle which is a cleaner proxy for a genuine directional impulse.
     breakout_impulse_confirm_enabled: bool = True
     breakout_impulse_body_atr_min: float = 0.40
+    breakout_impulse_body_atr_max: float = 2.50
     breakout_impulse_require_tick_volume: bool = False  # if True, require BOTH; else EITHER passes
 
     # 2.1 Event scoring. Keyword matches are binary; real desks score each
@@ -403,6 +415,17 @@ def load_settings() -> Settings:
             "GOLD_NEWS_URLS",
             "https://nfs.faireconomy.media/ff_calendar_thisweek.xml,https://www.forexfactory.com/ffcal_week_this.xml",
         ),
+        missed_opportunities_enabled=env_bool("MISSED_OPPORTUNITIES_ENABLED", True),
+        missed_opportunities_file=env_str("MISSED_OPPORTUNITIES_FILE", "missed_opportunities.json"),
+        missed_opportunities_max_records=env_int("MISSED_OPPORTUNITIES_MAX_RECORDS", 300),
+        missed_opportunity_horizons_hours=env_str("MISSED_OPPORTUNITY_HORIZONS_HOURS", "1,4,24"),
+        breakout_range_expansion_enabled=env_bool("BREAKOUT_RANGE_EXPANSION_ENABLED", True),
+        breakout_range_expansion_max_box_atr_ratio=env_float("BREAKOUT_RANGE_EXPANSION_MAX_BOX_ATR_RATIO", 5.0),
+        breakout_range_expansion_body_atr_min=env_float("BREAKOUT_RANGE_EXPANSION_BODY_ATR_MIN", 0.80),
+        breakout_range_expansion_stop_atr=env_float("BREAKOUT_RANGE_EXPANSION_STOP_ATR", 1.35),
+        trend_deep_pullback_enabled=env_bool("TREND_DEEP_PULLBACK_ENABLED", False),
+        trend_deep_pullback_atr_tolerance=env_float("TREND_DEEP_PULLBACK_ATR_TOLERANCE", 1.35),
+        trend_deep_pullback_min_strength_atr=env_float("TREND_DEEP_PULLBACK_MIN_STRENGTH_ATR", 1.40),
         gold_event_policy_enabled=env_bool("GOLD_EVENT_POLICY_ENABLED", True),
         gold_event_redis_key=env_str("GOLD_EVENT_REDIS_KEY", "gold:event_intelligence"),
         gold_event_state_file=env_str("GOLD_EVENT_STATE_FILE", env_str("GOLD_MACRO_STATE_FILE", "gold_macro_state.json")),
@@ -458,6 +481,7 @@ def load_settings() -> Settings:
         vol_target_nav_bps=env_float("VOL_TARGET_NAV_BPS", 25.0),
         breakout_impulse_confirm_enabled=env_bool("BREAKOUT_IMPULSE_CONFIRM_ENABLED", True),
         breakout_impulse_body_atr_min=env_float("BREAKOUT_IMPULSE_BODY_ATR_MIN", 0.40),
+        breakout_impulse_body_atr_max=env_float("BREAKOUT_IMPULSE_BODY_ATR_MAX", 2.50),
         breakout_impulse_require_tick_volume=env_bool("BREAKOUT_IMPULSE_REQUIRE_TICK_VOLUME", False),
         news_surprise_filter_enabled=env_bool("NEWS_SURPRISE_FILTER_ENABLED", False),
         news_surprise_min_composite=env_float("NEWS_SURPRISE_MIN_COMPOSITE", 0.60),
@@ -589,6 +613,18 @@ def _validate_settings(settings: Settings) -> None:
         raise ValueError("BREAKOUT_BOX_HOURS should be between 12 and 24")
     if settings.max_entry_spread <= 0:
         raise ValueError("MAX_ENTRY_SPREAD must be > 0")
+    if settings.missed_opportunities_max_records < 1:
+        raise ValueError("MISSED_OPPORTUNITIES_MAX_RECORDS must be >= 1")
+    if settings.breakout_range_expansion_max_box_atr_ratio <= settings.breakout_min_box_atr_ratio:
+        raise ValueError("BREAKOUT_RANGE_EXPANSION_MAX_BOX_ATR_RATIO must exceed BREAKOUT_MIN_BOX_ATR_RATIO")
+    if settings.breakout_range_expansion_body_atr_min <= 0:
+        raise ValueError("BREAKOUT_RANGE_EXPANSION_BODY_ATR_MIN must be > 0")
+    if settings.breakout_range_expansion_stop_atr <= 0:
+        raise ValueError("BREAKOUT_RANGE_EXPANSION_STOP_ATR must be > 0")
+    if settings.trend_deep_pullback_atr_tolerance < settings.trend_pullback_atr_tolerance:
+        raise ValueError("TREND_DEEP_PULLBACK_ATR_TOLERANCE must be >= TREND_PULLBACK_ATR_TOLERANCE")
+    if settings.trend_deep_pullback_min_strength_atr <= 0:
+        raise ValueError("TREND_DEEP_PULLBACK_MIN_STRENGTH_ATR must be > 0")
     if settings.breakout_min_volume_ratio < 1.0:
         raise ValueError("BREAKOUT_MIN_VOLUME_RATIO should be >= 1.0")
     if settings.breakout_volume_mode not in {"tick", "external", "hybrid"}:
@@ -640,6 +676,8 @@ def _validate_settings(settings: Settings) -> None:
         raise ValueError("VOL_TARGET_NAV_BPS must be > 0")
     if settings.breakout_impulse_body_atr_min <= 0:
         raise ValueError("BREAKOUT_IMPULSE_BODY_ATR_MIN must be > 0")
+    if settings.breakout_impulse_body_atr_max <= settings.breakout_impulse_body_atr_min:
+        raise ValueError("BREAKOUT_IMPULSE_BODY_ATR_MAX must exceed BREAKOUT_IMPULSE_BODY_ATR_MIN")
     if not (0.0 <= settings.news_surprise_min_composite <= 1.0):
         raise ValueError("NEWS_SURPRISE_MIN_COMPOSITE must be in [0, 1]")
     if settings.gold_event_refresh_seconds < 1:

@@ -82,6 +82,7 @@ class GoldBotRuntime:
         self.status_key = os.getenv("GOLD_BOT_STATUS_KEY", "gold_bot_runtime_status").strip()
         self.status_path = Path(os.getenv("GOLD_BOT_STATUS_FILE", str(self.state_path.with_name("gold_bot_runtime_status.json")))).expanduser()
         self.status_ttl = int(os.getenv("GOLD_STATUS_TTL", "1800"))
+        self.missed_opportunities_path = Path(self.settings.missed_opportunities_file).expanduser()
         self.telegram_token = os.getenv("GOLD_TELEGRAM_TOKEN", "").strip()
         self.telegram_chat_id = os.getenv("GOLD_TELEGRAM_CHAT_ID", "").strip()
         self.telegram_poll_seconds = max(1, int(os.getenv("GOLD_TELEGRAM_POLL_SECONDS", "5")))
@@ -279,6 +280,7 @@ class GoldBotRuntime:
             lookback_hours=self.settings.breakout_news_lookback_hours,
             lookahead_hours=self.settings.breakout_news_lookahead_hours,
         )
+        state["calendar_status"] = self._calendar_status(events, relevant_events, now)
 
         if any(0 <= (event.occurs_at - now).total_seconds() <= self.settings.pre_news_pause_minutes * 60 for event in relevant_events):
             log.info("Skipping scan inside pre-news pause window")
@@ -297,6 +299,8 @@ class GoldBotRuntime:
             self._save_state(state)
             self._publish_runtime_status("waiting_data", state, balance=balance)
             return None
+
+        self._refresh_missed_opportunity_marks(state, now, self._latest_mark_price(df_m15))
 
         usd_proxy_frames = {}
         if self.settings.usd_regime_filter_enabled:
@@ -357,6 +361,7 @@ class GoldBotRuntime:
             max_age_minutes=self.settings.news_score_state_max_age_minutes,
         )
         gold_event_state = self._refresh_gold_event_state()
+        state["gold_event_status"] = self._gold_event_status(gold_event_state, now)
 
         self._refresh_calibration()
 
@@ -519,6 +524,15 @@ class GoldBotRuntime:
                 "skip_reason": "no_signal",
                 "last_filter_reasons": rejection_reasons,
             })
+            self._record_missed_opportunity(
+                state,
+                now=now,
+                session_name=session_name,
+                mark_price=self._latest_mark_price(df_m15),
+                rejection_reasons=rejection_reasons,
+                regime=regime_classification.regime if regime_classification is not None else None,
+                atr_pct=regime_classification.atr_pct if regime_classification is not None else None,
+            )
             self._save_state(state)
             self._publish_runtime_status("scanning", state, balance=balance)
             return None
@@ -1267,6 +1281,175 @@ class GoldBotRuntime:
         state.setdefault("paused", False)
         return state
 
+    @staticmethod
+    def _latest_mark_price(df_m15) -> float | None:
+        if df_m15 is None or df_m15.empty:
+            return None
+        try:
+            value = float(df_m15["close"].iloc[-1])
+        except Exception:
+            return None
+        return value if value > 0 else None
+
+    def _missed_horizons(self) -> list[int]:
+        horizons: list[int] = []
+        for item in str(self.settings.missed_opportunity_horizons_hours or "").split(","):
+            try:
+                hours = int(item.strip())
+            except ValueError:
+                continue
+            if hours > 0 and hours not in horizons:
+                horizons.append(hours)
+        return horizons or [1, 4, 24]
+
+    def _refresh_missed_opportunity_marks(self, state: dict, now: datetime, mark_price: float | None) -> None:
+        if not self.settings.missed_opportunities_enabled or mark_price is None:
+            return
+        records = list(state.get("missed_opportunities", []))
+        if not records:
+            return
+        for record in records:
+            try:
+                initial_price = float(record.get("initial_price", 0.0) or 0.0)
+                recorded_at = datetime.fromisoformat(str(record.get("timestamp", "")))
+            except Exception:
+                continue
+            if recorded_at.tzinfo is None:
+                recorded_at = recorded_at.replace(tzinfo=timezone.utc)
+            if initial_price <= 0:
+                continue
+            elapsed_hours = max(0.0, (now - recorded_at).total_seconds() / 3600.0)
+            move_pct = (mark_price - initial_price) / initial_price
+            record["latest_price"] = round(mark_price, 3)
+            record["latest_move_pct"] = round(move_pct, 5)
+            record["max_up_pct"] = round(max(float(record.get("max_up_pct", move_pct)), move_pct), 5)
+            record["max_down_pct"] = round(min(float(record.get("max_down_pct", move_pct)), move_pct), 5)
+            marks = record.setdefault("forward_marks", {})
+            for horizon in self._missed_horizons():
+                key = f"{horizon}h"
+                if elapsed_hours >= horizon and key not in marks:
+                    marks[key] = {"price": round(mark_price, 3), "move_pct": round(move_pct, 5)}
+        state["missed_opportunities"] = records[-self.settings.missed_opportunities_max_records:]
+        state["missed_opportunity_summary"] = self._missed_opportunity_summary(state["missed_opportunities"])
+        self._persist_missed_opportunities(state)
+
+    def _record_missed_opportunity(
+        self,
+        state: dict,
+        *,
+        now: datetime,
+        session_name: str,
+        mark_price: float | None,
+        rejection_reasons: list[str],
+        regime: str | None,
+        atr_pct: float | None,
+    ) -> None:
+        if not self.settings.missed_opportunities_enabled or mark_price is None or not rejection_reasons:
+            return
+        watched_tokens = ("box_width_atr_ratio", "pullback_gap", "no_bear_confirmation", "no_bull_confirmation")
+        if not any(any(token in reason for token in watched_tokens) for reason in rejection_reasons):
+            return
+        fingerprint = "|".join(rejection_reasons[:4])
+        records = list(state.setdefault("missed_opportunities", []))
+        if records:
+            last = records[-1]
+            try:
+                last_time = datetime.fromisoformat(str(last.get("timestamp", "")))
+            except Exception:
+                last_time = now - timedelta(hours=1)
+            if last_time.tzinfo is None:
+                last_time = last_time.replace(tzinfo=timezone.utc)
+            if last.get("fingerprint") == fingerprint and now - last_time < timedelta(minutes=30):
+                return
+        records.append({
+            "id": str(uuid.uuid4()),
+            "timestamp": now.isoformat(),
+            "session": session_name,
+            "instrument": self.settings.instrument,
+            "initial_price": round(mark_price, 3),
+            "latest_price": round(mark_price, 3),
+            "latest_move_pct": 0.0,
+            "max_up_pct": 0.0,
+            "max_down_pct": 0.0,
+            "regime": regime,
+            "regime_atr_pct": round(float(atr_pct), 5) if atr_pct is not None else None,
+            "reasons": rejection_reasons[:8],
+            "fingerprint": fingerprint,
+            "forward_marks": {},
+        })
+        state["missed_opportunities"] = records[-self.settings.missed_opportunities_max_records:]
+        state["missed_opportunity_summary"] = self._missed_opportunity_summary(state["missed_opportunities"])
+        self._persist_missed_opportunities(state)
+
+    @staticmethod
+    def _missed_opportunity_summary(records: list[dict]) -> dict:
+        if not records:
+            return {"count": 0}
+        reason_counts: dict[str, int] = {}
+        for record in records[-50:]:
+            for reason in record.get("reasons", [])[:3]:
+                key = str(reason).split("=")[0]
+                reason_counts[key] = reason_counts.get(key, 0) + 1
+        top_reasons = sorted(reason_counts.items(), key=lambda item: item[1], reverse=True)[:5]
+        return {
+            "count": len(records),
+            "last_recorded_at": records[-1].get("timestamp"),
+            "top_reasons": [{"reason": reason, "count": count} for reason, count in top_reasons],
+        }
+
+    def _persist_missed_opportunities(self, state: dict) -> None:
+        if not self.settings.missed_opportunities_enabled:
+            return
+        payload = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "missed_opportunities": state.get("missed_opportunities", []),
+            "summary": state.get("missed_opportunity_summary", {"count": 0}),
+        }
+        try:
+            self.missed_opportunities_path.parent.mkdir(parents=True, exist_ok=True)
+            self.missed_opportunities_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception:
+            log.exception("Failed to persist missed-opportunity ledger")
+
+    @staticmethod
+    def _calendar_status(events: list, relevant_events: list, now: datetime) -> dict:
+        upcoming = []
+        for event in relevant_events:
+            occurs_at = getattr(event, "occurs_at", None)
+            if occurs_at is None:
+                continue
+            if occurs_at.tzinfo is None:
+                occurs_at = occurs_at.replace(tzinfo=timezone.utc)
+            if occurs_at >= now:
+                upcoming.append(occurs_at)
+        return {
+            "total_events": len(events),
+            "gold_relevant_events": len(relevant_events),
+            "next_event_at": min(upcoming).isoformat() if upcoming else None,
+        }
+
+    def _gold_event_status(self, event_state: dict | None, now: datetime) -> dict:
+        if not event_state:
+            return {"fresh": False, "reason": "missing"}
+        generated_at_text = event_state.get("generated_at") or event_state.get("as_of")
+        age_seconds = None
+        if generated_at_text:
+            try:
+                generated_at = datetime.fromisoformat(str(generated_at_text).replace("Z", "+00:00"))
+                if generated_at.tzinfo is None:
+                    generated_at = generated_at.replace(tzinfo=timezone.utc)
+                age_seconds = max(0.0, (now - generated_at.astimezone(timezone.utc)).total_seconds())
+            except ValueError:
+                age_seconds = None
+        events = event_state.get("events") if isinstance(event_state.get("events"), list) else []
+        fresh = age_seconds is not None and age_seconds <= self.settings.gold_event_stale_seconds
+        return {
+            "fresh": fresh,
+            "age_seconds": round(age_seconds, 1) if age_seconds is not None else None,
+            "event_count": len(events),
+            "gold_bias_score": event_state.get("gold_bias_score"),
+        }
+
     def _register_cooldown(self, state: dict, trade: dict, now: datetime) -> None:
         hours = self.settings.trend_stopout_cooldown_hours
         if hours <= 0:
@@ -1333,6 +1516,8 @@ class GoldBotRuntime:
             "factor_model": s.factor_model_enabled,
             "central_bank_flow": s.central_bank_flow_enabled,
             "risk_parity": s.risk_parity_enabled,
+            "range_expansion": s.breakout_range_expansion_enabled,
+            "missed_opportunities": s.missed_opportunities_enabled,
         }
         overlay_str = " ".join(
             f"{k}={'on' if v is True else ('off' if v is False else v)}"
@@ -1439,6 +1624,9 @@ class GoldBotRuntime:
             margin_available=state.get("account_margin_available"),
             account_currency=state.get("account_currency"),
             execution_mode=state.get("execution_mode", self.settings.execution_mode),
+            oanda_environment=self.settings.oanda_environment,
+            account_type=self.settings.account_type,
+            order_submission_enabled=self.settings.execution_mode == "live",
             paused=bool(state.get("paused", False)),
             open_trades=len(state.get("open_trades", [])),
             last_run_at=state.get("last_run_at"),
@@ -1446,6 +1634,10 @@ class GoldBotRuntime:
             skip_reason=state.get("skip_reason"),
             error=state.get("last_error"),
             calibration=self._calibration_summary(),
+            calendar=state.get("calendar_status"),
+            gold_event=state.get("gold_event_status"),
+            missed_opportunities=state.get("missed_opportunity_summary", {"count": 0}),
+            last_filter_reasons=state.get("last_filter_reasons", []),
         )
         self._maybe_send_heartbeat(state_name, state, balance)
 

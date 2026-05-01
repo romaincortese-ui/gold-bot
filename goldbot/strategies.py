@@ -130,9 +130,18 @@ def score_macro_breakout(
         if session_open_mode
         else settings.breakout_min_box_atr_ratio
     )
-    if box["width_atr_ratio"] <= 0 or box["width_atr_ratio"] > box_width_limit:
-        _reject(reasons, strategy, f"box_width_atr_ratio={box['width_atr_ratio']:.2f}>{box_width_limit}")
+    box_width_ratio = float(box["width_atr_ratio"])
+    if box_width_ratio <= 0:
+        _reject(reasons, strategy, f"box_width_atr_ratio={box_width_ratio:.2f}>{box_width_limit}")
         return None
+    range_expansion_mode = False
+    if box_width_ratio > box_width_limit:
+        expansion_enabled = bool(getattr(settings, "breakout_range_expansion_enabled", False))
+        expansion_limit = float(getattr(settings, "breakout_range_expansion_max_box_atr_ratio", box_width_limit))
+        if not (session_open_mode and expansion_enabled and box_width_ratio <= expansion_limit):
+            _reject(reasons, strategy, f"box_width_atr_ratio={box_width_ratio:.2f}>{box_width_limit}")
+            return None
+        range_expansion_mode = True
 
     atr = calc_atr(df_m15, settings.atr_period)
     buffer_size = atr * settings.breakout_buffer_atr
@@ -155,9 +164,13 @@ def score_macro_breakout(
     impulse_enabled = bool(getattr(settings, "breakout_impulse_confirm_enabled", False))
     require_both = bool(getattr(settings, "breakout_impulse_require_tick_volume", False))
     impulse_body_min = float(getattr(settings, "breakout_impulse_body_atr_min", 0.40))
+    impulse_body_max = float(getattr(settings, "breakout_impulse_body_atr_max", 2.50))
     impulse_signal = body_atr_ratio(df_m15, calc_atr(df_m15, settings.atr_period)) if impulse_enabled else None
 
     if impulse_enabled:
+        if impulse_signal is not None and impulse_signal.body_atr_ratio > impulse_body_max:
+            _reject(reasons, strategy, f"impulse_overextended(body_atr={impulse_signal.body_atr_ratio:.2f}>{impulse_body_max:.2f})")
+            return None
         # Direction of the breakout candle must match the direction we'll
         # ultimately trade — the caller checks last_close vs box later, but
         # we gate here on the candle direction too. If body/ATR + tick
@@ -173,8 +186,8 @@ def score_macro_breakout(
             volume_confirmation = dict(tick_confirmation)
         else:
             # OR semantics: impulse alone is enough; tick volume alone is too
-            if not impulse_ok_any and tick_confirmation is None:
-                _reject(reasons, strategy, f"impulse_and_volume_both_failed(body_atr={impulse_signal.body_atr_ratio:.2f},vol_ratio={volume_ratio:.2f})")
+            if not impulse_ok_any:
+                _reject(reasons, strategy, f"impulse_insufficient(body_atr={impulse_signal.body_atr_ratio:.2f},vol_ratio={volume_ratio:.2f})")
                 return None
             volume_confirmation = dict(tick_confirmation) if tick_confirmation is not None else {
                 "tick_volume_ratio": round(volume_ratio, 2),
@@ -189,6 +202,21 @@ def score_macro_breakout(
             _reject(reasons, strategy, f"volume_ratio={volume_ratio:.2f}<{settings.breakout_min_volume_ratio}")
             return None
         volume_confirmation = dict(tick_confirmation)
+
+    if range_expansion_mode:
+        if not impulse_enabled or impulse_signal is None:
+            _reject(reasons, "RANGE_EXPANSION_CONTINUATION", "impulse_required")
+            return None
+        expansion_body_min = float(getattr(settings, "breakout_range_expansion_body_atr_min", 0.80))
+        if impulse_signal.body_atr_ratio < expansion_body_min:
+            _reject(
+                reasons,
+                "RANGE_EXPANSION_CONTINUATION",
+                f"body_atr={impulse_signal.body_atr_ratio:.2f}<{expansion_body_min:.2f}",
+            )
+            return None
+        volume_confirmation["strategy_variant"] = "RANGE_EXPANSION_CONTINUATION"
+        volume_confirmation["wide_box_atr_ratio"] = round(box_width_ratio, 2)
 
     event_label = latest_event.title if latest_event is not None else ("SESSION_OPEN" if session_open_mode else "")
     rationale_prefix = (
@@ -214,29 +242,47 @@ def score_macro_breakout(
         if session_open_mode and trend_direction_hint == "SHORT":
             _reject(reasons, strategy, "long_break_against_h1_trend")
             return None
+        if impulse_enabled:
+            required_body_min = float(getattr(settings, "breakout_range_expansion_body_atr_min", 0.80)) if range_expansion_mode else impulse_body_min
+            if not confirms_breakout(impulse_signal, required_direction="UP", body_atr_min=required_body_min):
+                _reject(reasons, "RANGE_EXPANSION_CONTINUATION" if range_expansion_mode else strategy, "long_impulse_missing")
+                return None
         news_score_meta = _apply_news_surprise_gate(
             settings, "LONG", scored_events, session_open_mode, reasons
         )
         if news_score_meta is None:
             return None
-        stop_price = box["low"] - buffer_size
+        if range_expansion_mode:
+            stop_price = last_close - max(
+                atr * float(getattr(settings, "breakout_range_expansion_stop_atr", 1.35)),
+                buffer_size,
+            )
+            candidate_strategy = "RANGE_EXPANSION_CONTINUATION"
+            candidate_rationale = f"Range-expansion continuation above {box['high']:.2f}"
+        else:
+            stop_price = box["low"] - buffer_size
+            candidate_strategy = "MACRO_BREAKOUT"
+            candidate_rationale = rationale_prefix
         risk = last_close - stop_price
         score = 70 + min(20, ((last_close - box["high"]) / max(atr, 1e-9)) * 10)
         if session_open_mode:
             score -= 5  # modestly discount non-news breakouts
+        if range_expansion_mode:
+            score -= 3
         return Opportunity(
-            strategy="MACRO_BREAKOUT",
+            strategy=candidate_strategy,
             direction="LONG",
             score=score,
             entry_price=last_close,
             stop_price=stop_price,
             take_profit_price=None,
             risk_per_unit=risk,
-            rationale=rationale_prefix,
+            rationale=candidate_rationale,
             metadata={
                 "event": event_label,
                 "box_high": box["high"],
                 "box_low": box["low"],
+                "box_width_atr_ratio": round(box_width_ratio, 2),
                 "atr": atr,
                 "volume_ratio": round(volume_ratio, 2),
                 **volume_confirmation,
@@ -248,23 +294,39 @@ def score_macro_breakout(
         if session_open_mode and trend_direction_hint == "LONG":
             _reject(reasons, strategy, "short_break_against_h1_trend")
             return None
+        if impulse_enabled:
+            required_body_min = float(getattr(settings, "breakout_range_expansion_body_atr_min", 0.80)) if range_expansion_mode else impulse_body_min
+            if not confirms_breakout(impulse_signal, required_direction="DOWN", body_atr_min=required_body_min):
+                _reject(reasons, "RANGE_EXPANSION_CONTINUATION" if range_expansion_mode else strategy, "short_impulse_missing")
+                return None
         news_score_meta = _apply_news_surprise_gate(
             settings, "SHORT", scored_events, session_open_mode, reasons
         )
         if news_score_meta is None:
             return None
-        stop_price = box["high"] + buffer_size
+        if range_expansion_mode:
+            stop_price = last_close + max(
+                atr * float(getattr(settings, "breakout_range_expansion_stop_atr", 1.35)),
+                buffer_size,
+            )
+            candidate_strategy = "RANGE_EXPANSION_CONTINUATION"
+            rationale_short = f"Range-expansion continuation below {box['low']:.2f}"
+        else:
+            stop_price = box["high"] + buffer_size
+            candidate_strategy = "MACRO_BREAKOUT"
+            rationale_short = (
+                f"Session-open break below {box['low']:.2f}"
+                if session_open_mode
+                else f"Post-news break below {box['low']:.2f} after {latest_event.title}"
+            )
         risk = stop_price - last_close
         score = 70 + min(20, ((box["low"] - last_close) / max(atr, 1e-9)) * 10)
         if session_open_mode:
             score -= 5
-        rationale_short = (
-            f"Session-open break below {box['low']:.2f}"
-            if session_open_mode
-            else f"Post-news break below {box['low']:.2f} after {latest_event.title}"
-        )
+        if range_expansion_mode:
+            score -= 3
         return Opportunity(
-            strategy="MACRO_BREAKOUT",
+            strategy=candidate_strategy,
             direction="SHORT",
             score=score,
             entry_price=last_close,
@@ -276,6 +338,7 @@ def score_macro_breakout(
                 "event": event_label,
                 "box_high": box["high"],
                 "box_low": box["low"],
+                "box_width_atr_ratio": round(box_width_ratio, 2),
                 "atr": atr,
                 "volume_ratio": round(volume_ratio, 2),
                 **volume_confirmation,
@@ -571,12 +634,21 @@ def score_trend_pullback(
                 usd_risk_mult = settings.usd_regime_adverse_risk_multiplier
         support_probe = float(df_h1["low"].tail(3).min())
         pullback_gap = abs(support_probe - ema_fast_value)
+        deep_pullback = False
         if pullback_gap > atr_h4 * settings.trend_pullback_atr_tolerance:
-            _reject(reasons, strategy, f"pullback_gap={pullback_gap/atr_h4:.2f}ATR>{settings.trend_pullback_atr_tolerance}")
-            return None
-        stop_price = min(float(df_h1["low"].tail(5).min()), float(ema_fast.iloc[-1])) - atr_h4 * 0.6
+            deep_enabled = bool(getattr(settings, "trend_deep_pullback_enabled", False))
+            deep_tolerance = float(getattr(settings, "trend_deep_pullback_atr_tolerance", settings.trend_pullback_atr_tolerance))
+            deep_strength_min = float(getattr(settings, "trend_deep_pullback_min_strength_atr", settings.trend_min_strength_atr))
+            if not (deep_enabled and ema_reclaim_bull and pullback_gap <= atr_h4 * deep_tolerance and trend_strength >= deep_strength_min):
+                _reject(reasons, strategy, f"pullback_gap={pullback_gap/atr_h4:.2f}ATR>{settings.trend_pullback_atr_tolerance}")
+                return None
+            deep_pullback = True
+        stop_cushion = 0.8 if deep_pullback else 0.6
+        stop_price = min(float(df_h1["low"].tail(5).min()), float(ema_fast.iloc[-1])) - atr_h4 * stop_cushion
         risk = trigger_price - stop_price
         score = 68 + min(18, trend_strength * 6)
+        if deep_pullback:
+            score -= 4
         return Opportunity(
             strategy="TREND_PULLBACK",
             direction="LONG",
@@ -594,6 +666,8 @@ def score_trend_pullback(
                 "ema_fast_slope_atr": round(ema_fast_slope_atr, 3),
                 "usd_regime_bias_atr": round(usd_regime_bias, 3) if usd_regime_bias is not None else None,
                 "risk_multiplier": usd_risk_mult,
+                "strategy_variant": "DEEP_PULLBACK_RECLAIM" if deep_pullback else "STANDARD_PULLBACK",
+                "pullback_gap_atr": round(pullback_gap / atr_h4, 3),
             },
             exit_plan=_build_exit_plan(settings, "LONG", trigger_price, risk, atr_h4, timeframe="H1"),
         )
@@ -614,12 +688,21 @@ def score_trend_pullback(
                 usd_risk_mult = settings.usd_regime_adverse_risk_multiplier
         resistance_probe = float(df_h1["high"].tail(3).max())
         pullback_gap = abs(resistance_probe - ema_fast_value)
+        deep_pullback = False
         if pullback_gap > atr_h4 * settings.trend_pullback_atr_tolerance:
-            _reject(reasons, strategy, f"pullback_gap={pullback_gap/atr_h4:.2f}ATR>{settings.trend_pullback_atr_tolerance}")
-            return None
-        stop_price = max(float(df_h1["high"].tail(5).max()), float(ema_fast.iloc[-1])) + atr_h4 * 0.6
+            deep_enabled = bool(getattr(settings, "trend_deep_pullback_enabled", False))
+            deep_tolerance = float(getattr(settings, "trend_deep_pullback_atr_tolerance", settings.trend_pullback_atr_tolerance))
+            deep_strength_min = float(getattr(settings, "trend_deep_pullback_min_strength_atr", settings.trend_min_strength_atr))
+            if not (deep_enabled and ema_reclaim_bear and pullback_gap <= atr_h4 * deep_tolerance and trend_strength >= deep_strength_min):
+                _reject(reasons, strategy, f"pullback_gap={pullback_gap/atr_h4:.2f}ATR>{settings.trend_pullback_atr_tolerance}")
+                return None
+            deep_pullback = True
+        stop_cushion = 0.8 if deep_pullback else 0.6
+        stop_price = max(float(df_h1["high"].tail(5).max()), float(ema_fast.iloc[-1])) + atr_h4 * stop_cushion
         risk = stop_price - trigger_price
         score = 68 + min(18, trend_strength * 6)
+        if deep_pullback:
+            score -= 4
         return Opportunity(
             strategy="TREND_PULLBACK",
             direction="SHORT",
@@ -637,6 +720,8 @@ def score_trend_pullback(
                 "ema_fast_slope_atr": round(ema_fast_slope_atr, 3),
                 "usd_regime_bias_atr": round(usd_regime_bias, 3) if usd_regime_bias is not None else None,
                 "risk_multiplier": usd_risk_mult,
+                "strategy_variant": "DEEP_PULLBACK_RECLAIM" if deep_pullback else "STANDARD_PULLBACK",
+                "pullback_gap_atr": round(pullback_gap / atr_h4, 3),
             },
             exit_plan=_build_exit_plan(settings, "SHORT", trigger_price, risk, atr_h4, timeframe="H1"),
         )

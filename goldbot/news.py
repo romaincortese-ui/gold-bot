@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -17,6 +18,9 @@ from goldbot.models import CalendarEvent
 
 log = logging.getLogger(__name__)
 
+_calendar_failed_until: dict[str, float] = {}
+_calendar_last_warning_at: dict[str, float] = {}
+
 GOLD_NEWS_KEYWORDS = (
     "nfp",
     "non-farm",
@@ -31,18 +35,36 @@ GOLD_NEWS_KEYWORDS = (
 )
 
 
-def fetch_calendar_events(urls: list[str], cache_file: str, timeout: int = 20) -> list[CalendarEvent]:
+def fetch_calendar_events(
+    urls: list[str],
+    cache_file: str,
+    timeout: int = 20,
+    *,
+    failure_backoff_minutes: int = 15,
+) -> list[CalendarEvent]:
+    cached_events = _read_cache(cache_file)
+    monotonic_now = time.monotonic()
     for url in urls:
+        if _calendar_failed_until.get(url, 0.0) > monotonic_now:
+            continue
         try:
             response = requests.get(url, timeout=timeout)
             response.raise_for_status()
             events = parse_calendar_events(response.text, url)
             if events:
+                _calendar_failed_until.pop(url, None)
+                _calendar_last_warning_at.pop(url, None)
                 _write_cache(cache_file, events)
                 return events
         except Exception as exc:
-            log.warning("Calendar fetch failed for %s: %s", url, exc)
-    return _read_cache(cache_file)
+            _calendar_failed_until[url] = monotonic_now + max(0, failure_backoff_minutes) * 60
+            last_warning_at = _calendar_last_warning_at.get(url, 0.0)
+            if last_warning_at == 0.0 or monotonic_now - last_warning_at >= 3600:
+                log.warning("Calendar fetch failed for %s: %s", url, exc)
+                _calendar_last_warning_at[url] = monotonic_now
+    if cached_events:
+        log.info("Using cached calendar events after provider failure/backoff (%d events)", len(cached_events))
+    return cached_events
 
 
 def parse_calendar_events(xml_text: str, source: str) -> list[CalendarEvent]:

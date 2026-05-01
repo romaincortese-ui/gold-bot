@@ -89,7 +89,8 @@ def test_score_macro_breakout_finds_post_news_long_break() -> None:
         if index >= 56:
             close = 3014.5 + (index - 56) * 1.2
         volume = 150 if index == len(m15_times) - 1 else 100
-        m15_rows.append({"time": timestamp, "open": close - 0.3, "high": close + 0.5, "low": close - 0.6, "close": close, "volume": volume})
+        open_price = close - (2.4 if index == len(m15_times) - 1 else 0.3)
+        m15_rows.append({"time": timestamp, "open": open_price, "high": close + 0.5, "low": open_price - 0.3, "close": close, "volume": volume})
     df_m15 = pd.DataFrame(m15_rows)
 
     event = CalendarEvent("US CPI", "USD", "high", event_time, "test")
@@ -100,6 +101,65 @@ def test_score_macro_breakout_finds_post_news_long_break() -> None:
     assert opportunity.direction == "LONG"
     assert opportunity.metadata["volume_ratio"] >= settings.breakout_min_volume_ratio
     assert opportunity.take_profit_price is None
+
+
+def test_score_macro_breakout_range_expansion_is_separate_session_open_path() -> None:
+    settings = build_settings()
+    settings = Settings(
+        **{
+            **settings.__dict__,
+            "breakout_overlap_only": False,
+            "breakout_session_open_min_box_atr_ratio": 2.75,
+            "breakout_range_expansion_max_box_atr_ratio": 5.0,
+            "breakout_range_expansion_body_atr_min": 0.8,
+        }
+    )
+    disabled_settings = Settings(**{**settings.__dict__, "breakout_range_expansion_enabled": False})
+    now = datetime(2026, 4, 6, 13, 0, tzinfo=timezone.utc)
+
+    h1_times = pd.date_range(end=now, periods=40, freq="h", tz="UTC")
+    h1_rows = []
+    for timestamp in h1_times:
+        in_box = 4 <= timestamp.hour < 12 and timestamp.date() == now.date()
+        if in_box:
+            close = 2999.0 + (timestamp.hour - 4) * 2.0
+            high = close + 1.0
+            low = close - 1.0
+        else:
+            high = 3011.0
+            low = 3007.0
+            close = 3009.0
+        h1_rows.append({"time": timestamp, "open": close - 0.5, "high": high, "low": low, "close": close, "volume": 100})
+    df_h1 = pd.DataFrame(h1_rows)
+
+    m15_times = pd.date_range(end=now, periods=60, freq="15min", tz="UTC")
+    m15_rows = []
+    for index, timestamp in enumerate(m15_times):
+        close = 3010.0
+        open_price = close - 0.4
+        high = close + 0.6
+        low = close - 0.6
+        if index == len(m15_times) - 2:
+            close = 3016.0
+            open_price = 3014.2
+            high = 3016.4
+            low = 3013.8
+        if index == len(m15_times) - 1:
+            close = 3018.5
+            open_price = 3015.0
+            high = 3019.0
+            low = 3014.8
+        m15_rows.append({"time": timestamp, "open": open_price, "high": high, "low": low, "close": close, "volume": 150})
+    df_m15 = pd.DataFrame(m15_rows)
+
+    rejected = score_macro_breakout(disabled_settings, now, "OVERLAP", df_m15, df_h1, [], reasons=[])
+    opportunity = score_macro_breakout(settings, now, "OVERLAP", df_m15, df_h1, [], reasons=[])
+
+    assert rejected is None
+    assert opportunity is not None
+    assert opportunity.strategy == "RANGE_EXPANSION_CONTINUATION"
+    assert opportunity.direction == "LONG"
+    assert opportunity.metadata["strategy_variant"] == "RANGE_EXPANSION_CONTINUATION"
 
 
 def test_score_event_catalyst_breakout_requires_aligned_price_break() -> None:
@@ -119,7 +179,8 @@ def test_score_event_catalyst_breakout_requires_aligned_price_break() -> None:
         if index >= 56:
             close = 3014.5 + (index - 56) * 1.2
         volume = 150 if index == len(m15_times) - 1 else 100
-        m15_rows.append({"time": timestamp, "open": close - 0.3, "high": close + 0.5, "low": close - 0.6, "close": close, "volume": volume})
+        open_price = close - (2.4 if index == len(m15_times) - 1 else 0.3)
+        m15_rows.append({"time": timestamp, "open": open_price, "high": close + 0.5, "low": open_price - 0.3, "close": close, "volume": volume})
     df_m15 = pd.DataFrame(m15_rows)
 
     opportunity = score_event_catalyst_breakout(
@@ -251,7 +312,8 @@ def test_score_macro_breakout_accepts_external_volume_confirmation() -> None:
         if index >= 56:
             close = 3014.5 + (index - 56) * 1.2
         volume = 150 if index == len(m15_times) - 1 else 100
-        m15_rows.append({"time": timestamp, "open": close - 0.3, "high": close + 0.5, "low": close - 0.6, "close": close, "volume": volume})
+        open_price = close - (2.4 if index == len(m15_times) - 1 else 0.3)
+        m15_rows.append({"time": timestamp, "open": open_price, "high": close + 0.5, "low": open_price - 0.3, "close": close, "volume": volume})
     df_m15 = pd.DataFrame(m15_rows)
 
     opportunity = score_macro_breakout(

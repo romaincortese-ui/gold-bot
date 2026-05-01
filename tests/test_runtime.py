@@ -8,6 +8,30 @@ def _disable_redis(monkeypatch) -> None:
     monkeypatch.delenv("REDIS_URL", raising=False)
 
 
+def test_missed_opportunity_ledger_records_and_marks_forward_moves(tmp_path, monkeypatch) -> None:
+    _disable_redis(monkeypatch)
+    runtime = GoldBotRuntime()
+    runtime.missed_opportunities_path = tmp_path / "missed.json"
+    now = datetime(2026, 4, 6, 13, 0, tzinfo=timezone.utc)
+    state = {}
+
+    runtime._record_missed_opportunity(
+        state,
+        now=now,
+        session_name="OVERLAP",
+        mark_price=3000.0,
+        rejection_reasons=["MACRO_BREAKOUT:box_width_atr_ratio=3.59>2.75"],
+        regime="trend",
+        atr_pct=0.0082,
+    )
+    runtime._refresh_missed_opportunity_marks(state, now + timedelta(hours=4), 3030.0)
+
+    assert state["missed_opportunity_summary"]["count"] == 1
+    assert state["missed_opportunities"][0]["forward_marks"]["4h"]["move_pct"] == 0.01
+    payload = json.loads(runtime.missed_opportunities_path.read_text(encoding="utf-8"))
+    assert payload["summary"]["count"] == 1
+
+
 def test_manage_open_trade_moves_break_even_and_partial(tmp_path, monkeypatch) -> None:
     _disable_redis(monkeypatch)
     runtime = GoldBotRuntime()
