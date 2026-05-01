@@ -20,6 +20,16 @@ class GoldEventPolicyDecision:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class GoldEventCatalystDecision:
+    direction: str | None
+    reason: str
+    gold_bias_score: float = 0.0
+    event_count: int = 0
+    extreme_event_count: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
 def is_event_state_fresh(
     state: Mapping[str, Any] | None,
     now: datetime,
@@ -75,6 +85,56 @@ def apply_gold_event_policy(
     return opportunity, decision
 
 
+def evaluate_gold_event_catalyst(
+    settings: Any,
+    state: Mapping[str, Any] | None,
+    now: datetime,
+) -> GoldEventCatalystDecision:
+    if not getattr(settings, "gold_event_policy_enabled", True):
+        return GoldEventCatalystDecision(direction=None, reason="disabled")
+    if not getattr(settings, "gold_event_catalyst_enabled", True):
+        return GoldEventCatalystDecision(direction=None, reason="catalyst_disabled")
+    stale_seconds = int(getattr(settings, "gold_event_stale_seconds", 7200))
+    if not is_event_state_fresh(state, now, max_age_seconds=stale_seconds):
+        return GoldEventCatalystDecision(direction=None, reason="no_fresh_event_state")
+
+    high_impact_window_minutes = int(getattr(settings, "gold_event_high_impact_window_minutes", 180))
+    extreme_window_minutes = int(getattr(settings, "gold_event_extreme_window_minutes", 30))
+    components, events = _gold_event_bias_components(
+        state or {},
+        now,
+        high_impact_window_minutes,
+        extreme_window_minutes,
+    )
+    gold_bias = _weighted_average(components)
+    event_count = len(events)
+    extreme_count = sum(1 for event in events if event["extreme"])
+    min_bias = float(getattr(settings, "gold_event_catalyst_min_bias", 0.35))
+    metadata = {
+        "gold_event_components": [name for name, score, _weight in components if abs(score) > 1e-9],
+        "gold_event_catalyst_bias": round(gold_bias, 4),
+        "gold_event_catalyst_events": event_count,
+        "gold_event_catalyst_extreme_events": extreme_count,
+    }
+    if abs(gold_bias) < min_bias:
+        return GoldEventCatalystDecision(
+            direction=None,
+            reason="event_bias_below_catalyst_threshold",
+            gold_bias_score=gold_bias,
+            event_count=event_count,
+            extreme_event_count=extreme_count,
+            metadata=metadata,
+        )
+    return GoldEventCatalystDecision(
+        direction="LONG" if gold_bias > 0 else "SHORT",
+        reason="event_catalyst_long" if gold_bias > 0 else "event_catalyst_short",
+        gold_bias_score=gold_bias,
+        event_count=event_count,
+        extreme_event_count=extreme_count,
+        metadata=metadata,
+    )
+
+
 def evaluate_gold_event_policy(
     opportunity: Opportunity,
     state: Mapping[str, Any] | None,
@@ -95,17 +155,12 @@ def evaluate_gold_event_policy(
     if direction_sign == 0.0:
         return GoldEventPolicyDecision(allowed=True, reason="unknown_direction")
 
-    events = _events_near_now(state, now, high_impact_window_minutes, extreme_window_minutes)
-    components: list[tuple[str, float, float]] = []
-    for event in events:
-        title_score = _title_gold_bias(event["title"])
-        if abs(title_score) > 1e-9:
-            components.append(("event_title", title_score, 0.5))
-
-    components.extend(_event_score_components(state, now, high_impact_window_minutes))
-    real_yield_component = _real_yield_component(state, now)
-    if real_yield_component is not None:
-        components.append(real_yield_component)
+    components, events = _gold_event_bias_components(
+        state,
+        now,
+        high_impact_window_minutes,
+        extreme_window_minutes,
+    )
 
     gold_bias = _weighted_average(components)
     align = direction_sign * gold_bias
@@ -172,6 +227,26 @@ def evaluate_gold_event_policy(
         extreme_event_count=extreme_count,
         metadata=metadata,
     )
+
+
+def _gold_event_bias_components(
+    state: Mapping[str, Any],
+    now: datetime,
+    high_impact_window_minutes: int,
+    extreme_window_minutes: int,
+) -> tuple[list[tuple[str, float, float]], list[dict[str, Any]]]:
+    events = _events_near_now(state, now, high_impact_window_minutes, extreme_window_minutes)
+    components: list[tuple[str, float, float]] = []
+    for event in events:
+        title_score = _title_gold_bias(event["title"])
+        if abs(title_score) > 1e-9:
+            components.append(("event_title", title_score, 0.5))
+
+    components.extend(_event_score_components(state, now, high_impact_window_minutes))
+    real_yield_component = _real_yield_component(state, now)
+    if real_yield_component is not None:
+        components.append(real_yield_component)
+    return components, events
 
 
 def parse_event_timestamp(value: Any) -> datetime | None:

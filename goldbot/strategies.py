@@ -287,6 +287,48 @@ def score_macro_breakout(
     return None
 
 
+def score_event_catalyst_breakout(
+    settings: Settings,
+    now: datetime,
+    session_name: str,
+    df_m15: pd.DataFrame,
+    df_h1: pd.DataFrame,
+    *,
+    direction: str,
+    catalyst_metadata: dict | None = None,
+    breakout_volume_signal: BreakoutVolumeSignal | None = None,
+    reasons: list[str] | None = None,
+    scored_events: list[EventScore] | None = None,
+) -> Opportunity | None:
+    event_time = now - timedelta(minutes=max(1, int(settings.post_news_settle_minutes)))
+    event = CalendarEvent("Gold event catalyst", "USD", "high", event_time, "gold_event_state")
+    candidate = score_macro_breakout(
+        settings,
+        now,
+        session_name,
+        df_m15,
+        df_h1,
+        [event],
+        breakout_volume_signal,
+        reasons=reasons,
+        scored_events=scored_events,
+    )
+    if candidate is None:
+        _reject(reasons, "EVENT_CATALYST", "price_confirmation_missing")
+        return None
+    wanted_direction = direction.upper()
+    if candidate.direction != wanted_direction:
+        _reject(reasons, "EVENT_CATALYST", f"breakout_direction_{candidate.direction}_not_{wanted_direction}")
+        return None
+    metadata = dict(candidate.metadata or {})
+    metadata.update(catalyst_metadata or {})
+    metadata["gold_event_catalyst"] = True
+    metadata["strategy_variant"] = "EVENT_CATALYST_BREAKOUT"
+    candidate.metadata = metadata
+    candidate.rationale = f"Event-catalyst {candidate.rationale}"
+    return candidate
+
+
 def _apply_news_surprise_gate(
     settings: Settings,
     direction: str,

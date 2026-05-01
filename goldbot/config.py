@@ -121,6 +121,8 @@ class Settings:
     gold_event_adverse_risk_multiplier: float = 0.5
     gold_event_favourable_risk_multiplier: float = 1.15
     gold_event_score_offset: float = 4.0
+    gold_event_catalyst_enabled: bool = True
+    gold_event_catalyst_min_bias: float = 0.35
     breakout_volume_mode: str = "tick"
     breakout_external_volume_file: str = ""
     breakout_external_volume_max_age_minutes: int = 30
@@ -411,6 +413,8 @@ def load_settings() -> Settings:
         gold_event_adverse_risk_multiplier=env_float("GOLD_EVENT_ADVERSE_RISK_MULTIPLIER", 0.5),
         gold_event_favourable_risk_multiplier=env_float("GOLD_EVENT_FAVOURABLE_RISK_MULTIPLIER", 1.15),
         gold_event_score_offset=env_float("GOLD_EVENT_SCORE_OFFSET", 4.0),
+        gold_event_catalyst_enabled=env_bool("GOLD_EVENT_CATALYST_ENABLED", True),
+        gold_event_catalyst_min_bias=env_float("GOLD_EVENT_CATALYST_MIN_BIAS", 0.35),
         breakout_volume_mode=env_str("BREAKOUT_VOLUME_MODE", "tick").lower(),
         breakout_external_volume_file=env_str("BREAKOUT_EXTERNAL_VOLUME_FILE", ""),
         breakout_external_volume_max_age_minutes=env_int("BREAKOUT_EXTERNAL_VOLUME_MAX_AGE_MINUTES", 30),

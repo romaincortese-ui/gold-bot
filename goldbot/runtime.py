@@ -22,7 +22,7 @@ from goldbot.calibration import (
     validate_calibration,
 )
 from goldbot.config import load_settings
-from goldbot.event_policy import apply_gold_event_policy
+from goldbot.event_policy import apply_gold_event_policy, evaluate_gold_event_catalyst
 from goldbot.marketdata import OandaClient, SpreadTooWideError
 from goldbot.models import Opportunity
 from goldbot.news import fetch_calendar_events, filter_gold_events
@@ -54,6 +54,7 @@ from goldbot.weekend_guard import (
 )
 from goldbot.strategies import (
     score_exhaustion_reversal,
+    score_event_catalyst_breakout,
     score_macro_breakout,
     score_trend_pullback,
     select_best_opportunity,
@@ -381,6 +382,33 @@ class GoldBotRuntime:
                 score_exhaustion_reversal(self.settings, df_h4, df_d1, reasons=rejection_reasons),
                 score_trend_pullback(self.settings, df_h1, df_h4, usd_proxy_frames, reasons=rejection_reasons),
             ]
+            catalyst_decision = evaluate_gold_event_catalyst(self.settings, gold_event_state, now)
+            if catalyst_decision.direction:
+                catalyst_opportunity = score_event_catalyst_breakout(
+                    self.settings,
+                    now,
+                    session_name,
+                    df_m15,
+                    df_h1,
+                    direction=catalyst_decision.direction,
+                    catalyst_metadata={
+                        **catalyst_decision.metadata,
+                        "gold_event_catalyst_reason": catalyst_decision.reason,
+                    },
+                    breakout_volume_signal=breakout_volume_signal,
+                    reasons=rejection_reasons,
+                    scored_events=scored_events,
+                )
+                if catalyst_opportunity is not None:
+                    log.info(
+                        "Gold event catalyst created %s candidate (bias=%.2f events=%d)",
+                        catalyst_opportunity.direction,
+                        catalyst_decision.gold_bias_score,
+                        catalyst_decision.event_count,
+                    )
+                    opportunities.append(catalyst_opportunity)
+            elif catalyst_decision.reason not in {"disabled", "catalyst_disabled", "no_fresh_event_state"}:
+                rejection_reasons.append(f"gold_event_catalyst:{catalyst_decision.reason}")
 
         # Sprint 3 §3.2: classify current vol regime from H4 ATR% (falls back
         # to H1 if H4 unavailable) and filter strategies not allowed under it.

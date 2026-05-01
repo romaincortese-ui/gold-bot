@@ -4,7 +4,7 @@ import pandas as pd
 
 from goldbot.config import Settings
 from goldbot.models import CalendarEvent
-from goldbot.strategies import score_macro_breakout, score_trend_pullback
+from goldbot.strategies import score_event_catalyst_breakout, score_macro_breakout, score_trend_pullback
 from goldbot.volume_oracle import BreakoutVolumeSignal
 
 
@@ -100,6 +100,53 @@ def test_score_macro_breakout_finds_post_news_long_break() -> None:
     assert opportunity.direction == "LONG"
     assert opportunity.metadata["volume_ratio"] >= settings.breakout_min_volume_ratio
     assert opportunity.take_profit_price is None
+
+
+def test_score_event_catalyst_breakout_requires_aligned_price_break() -> None:
+    settings = build_settings()
+    now = datetime(2026, 4, 6, 13, 0, tzinfo=timezone.utc)
+    h1_times = pd.date_range(end=now, periods=40, freq="h", tz="UTC")
+    df_h1 = pd.DataFrame(
+        [
+            {"time": timestamp, "open": 3010.0, "high": 3012.0, "low": 3008.0, "close": 3010.4, "volume": 100}
+            for timestamp in h1_times
+        ]
+    )
+    m15_times = pd.date_range(end=now, periods=60, freq="15min", tz="UTC")
+    m15_rows = []
+    for index, timestamp in enumerate(m15_times):
+        close = 3010.0 + (index * 0.05)
+        if index >= 56:
+            close = 3014.5 + (index - 56) * 1.2
+        volume = 150 if index == len(m15_times) - 1 else 100
+        m15_rows.append({"time": timestamp, "open": close - 0.3, "high": close + 0.5, "low": close - 0.6, "close": close, "volume": volume})
+    df_m15 = pd.DataFrame(m15_rows)
+
+    opportunity = score_event_catalyst_breakout(
+        settings,
+        now,
+        "OVERLAP",
+        df_m15,
+        df_h1,
+        direction="LONG",
+        catalyst_metadata={"gold_event_catalyst_bias": 0.7},
+    )
+    mismatch = score_event_catalyst_breakout(
+        settings,
+        now,
+        "OVERLAP",
+        df_m15,
+        df_h1,
+        direction="SHORT",
+        catalyst_metadata={"gold_event_catalyst_bias": -0.7},
+    )
+
+    assert opportunity is not None
+    assert opportunity.strategy == "MACRO_BREAKOUT"
+    assert opportunity.direction == "LONG"
+    assert opportunity.metadata["gold_event_catalyst"] is True
+    assert opportunity.metadata["strategy_variant"] == "EVENT_CATALYST_BREAKOUT"
+    assert mismatch is None
 
 
 def test_score_trend_pullback_identifies_bullish_setup() -> None:

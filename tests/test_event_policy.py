@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from goldbot.event_policy import apply_gold_event_policy, evaluate_gold_event_policy, is_event_state_fresh
+from goldbot.event_policy import apply_gold_event_policy, evaluate_gold_event_catalyst, evaluate_gold_event_policy, is_event_state_fresh
 from goldbot.models import Opportunity
 from tests.test_strategies import build_settings
 
@@ -94,3 +94,33 @@ def test_policy_blocks_extreme_adverse_event() -> None:
 
     assert decision.allowed is False
     assert decision.reason == "extreme_event_adverse"
+
+
+def test_event_catalyst_selects_long_from_dovish_event_state() -> None:
+    now = datetime(2026, 4, 7, 12, 0, tzinfo=timezone.utc)
+    state = {
+        "generated_at": now.isoformat(),
+        "event_scores": [
+            {
+                "as_of": (now - timedelta(minutes=15)).isoformat(),
+                "composite": 0.75,
+                "usd_direction": "DOWN",
+            }
+        ],
+    }
+
+    decision = evaluate_gold_event_catalyst(build_settings(), state, now)
+
+    assert decision.direction == "LONG"
+    assert decision.reason == "event_catalyst_long"
+    assert decision.gold_bias_score >= 0.35
+
+
+def test_event_catalyst_stays_neutral_without_strong_bias() -> None:
+    now = datetime(2026, 4, 7, 12, 0, tzinfo=timezone.utc)
+    state = {"generated_at": now.isoformat(), "events": []}
+
+    decision = evaluate_gold_event_catalyst(build_settings(), state, now)
+
+    assert decision.direction is None
+    assert decision.reason == "event_bias_below_catalyst_threshold"
