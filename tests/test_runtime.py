@@ -8,6 +8,11 @@ def _disable_redis(monkeypatch) -> None:
     monkeypatch.delenv("REDIS_URL", raising=False)
 
 
+def _isolate_runtime_files(runtime: GoldBotRuntime, tmp_path) -> None:
+    runtime.status_path = tmp_path / "status.json"
+    runtime.budget.path = tmp_path / "shared_budget.json"
+
+
 def test_missed_opportunity_ledger_records_and_marks_forward_moves(tmp_path, monkeypatch) -> None:
     _disable_redis(monkeypatch)
     runtime = GoldBotRuntime()
@@ -92,9 +97,8 @@ def test_manage_open_trade_moves_break_even_and_partial(tmp_path, monkeypatch) -
 
 
 def test_manage_open_trade_skips_partial_when_size_too_small(tmp_path, monkeypatch) -> None:
-    """A 1-unit XAU position cannot be scaled out by 50% (rounds to 0 units,
-    which OANDA rejects with 400 Bad Request). Ensure we mark partial_taken
-    and skip the close so the failure does not loop every cycle."""
+    """A 0.1-unit XAU position cannot be scaled out by 50% because the
+    partial size falls below OANDA's 0.1 minimum trade size."""
 
     _disable_redis(monkeypatch)
     runtime = GoldBotRuntime()
@@ -112,8 +116,8 @@ def test_manage_open_trade_skips_partial_when_size_too_small(tmp_path, monkeypat
                 "stop_price": 2995.0,
                 "initial_stop_price": 2995.0,
                 "initial_risk_per_unit": 5.0,
-                "size": 1.0,
-                "remaining_size": 1.0,
+                "size": 0.1,
+                "remaining_size": 0.1,
                 "risk_amount": 10.0,
                 "partial_taken": False,
                 "break_even_moved": False,
@@ -155,7 +159,7 @@ def test_manage_open_trade_skips_partial_when_size_too_small(tmp_path, monkeypat
     trade = updated["open_trades"][0]
 
     assert trade["partial_taken"] is True
-    assert trade["remaining_size"] == 1.0
+    assert trade["remaining_size"] == 0.1
     assert close_calls == []
     assert any(event["type"] == "partial_skipped" for event in updated.get("events", []))
 
@@ -163,6 +167,7 @@ def test_manage_open_trade_skips_partial_when_size_too_small(tmp_path, monkeypat
 def test_run_cycle_skips_new_entry_when_state_trade_exists(tmp_path, monkeypatch) -> None:
     _disable_redis(monkeypatch)
     runtime = GoldBotRuntime()
+    _isolate_runtime_files(runtime, tmp_path)
     runtime.state_path = tmp_path / "state.json"
     runtime._save_state(
         {
@@ -202,6 +207,7 @@ def test_run_cycle_skips_new_entry_when_state_trade_exists(tmp_path, monkeypatch
 def test_run_cycle_honors_manual_pause_state(tmp_path, monkeypatch) -> None:
     _disable_redis(monkeypatch)
     runtime = GoldBotRuntime()
+    _isolate_runtime_files(runtime, tmp_path)
     runtime.state_path = tmp_path / "state.json"
     runtime._save_state({"signals": [], "open_trades": [], "events": [], "paused": True})
 
@@ -215,6 +221,7 @@ def test_run_cycle_honors_manual_pause_state(tmp_path, monkeypatch) -> None:
 def test_run_cycle_applies_queued_pause_request(tmp_path, monkeypatch) -> None:
     _disable_redis(monkeypatch)
     runtime = GoldBotRuntime()
+    _isolate_runtime_files(runtime, tmp_path)
     runtime.state_path = tmp_path / "state.json"
     runtime._save_state(
         {
@@ -335,9 +342,10 @@ def test_await_entry_quote_requires_macro_spread_stability(monkeypatch) -> None:
     assert quote["spread"] == 0.42
 
 
-def test_run_cycle_scales_risk_when_real_yields_are_adverse(tmp_path, monkeypatch) -> None:
+def test_run_cycle_records_real_yield_overlay_with_balance_sizing(tmp_path, monkeypatch) -> None:
     _disable_redis(monkeypatch)
     runtime = GoldBotRuntime()
+    _isolate_runtime_files(runtime, tmp_path)
     runtime.state_path = tmp_path / "state.json"
     runtime._save_state({"signals": [], "open_trades": [], "events": []})
     runtime.settings = type(runtime.settings)(
@@ -346,8 +354,6 @@ def test_run_cycle_scales_risk_when_real_yields_are_adverse(tmp_path, monkeypatc
             "real_yield_filter_enabled": True,
             "macro_state_file": str(tmp_path / "macro.json"),
             "execution_mode": "paper",
-            # Keep legacy risk-sizing math stable for this regression check.
-            "vol_target_sizing_enabled": False,
             # Level gate is a *separate* Sprint 1 behaviour; exercise the
             # change-bps scaling branch only by staying below the veto level.
             "real_yield_level_gate_enabled": False,
@@ -373,7 +379,7 @@ def test_run_cycle_scales_risk_when_real_yields_are_adverse(tmp_path, monkeypatc
     monkeypatch.setattr(runtime, "_session_name", lambda now: "LONDON")
     monkeypatch.setattr(runtime.client, "get_account_summary", lambda: {"balance": 10000.0, "currency": "GBP"})
     monkeypatch.setattr(runtime.client, "fetch_candles", lambda instrument, granularity, count: __import__("pandas").DataFrame([{"time": datetime.now(timezone.utc), "open": 3000.0, "high": 3001.0, "low": 2999.0, "close": 3000.5, "volume": 100}] * 260))
-    monkeypatch.setattr(runtime.client, "calculate_xau_size", lambda risk_amount, stop_distance, account_currency: round(risk_amount, 2))
+    monkeypatch.setattr(runtime.client, "calculate_xau_balance_size", lambda balance_amount, entry_price, account_currency: 2.0)
     monkeypatch.setattr(runtime.client, "place_market_order", lambda opportunity, size, quote=None: {"id": "paper-1", "price": 3000.5, "mode": "paper"})
     monkeypatch.setattr(runtime.client, "get_price", lambda instrument: {"bid": 3000.4, "ask": 3000.6, "mid": 3000.5, "spread": 0.2})
     monkeypatch.setattr("goldbot.runtime.fetch_calendar_events", lambda *args, **kwargs: [])
@@ -405,7 +411,12 @@ def test_run_cycle_scales_risk_when_real_yields_are_adverse(tmp_path, monkeypatc
     runtime.run_cycle()
     saved = json.loads(runtime.state_path.read_text(encoding="utf-8"))
 
-    assert saved["last_signal"]["risk_amount"] == 18.75
+    assert saved["last_signal"]["metadata"]["macro_filter"] == "real_yield_long_reduced"
+    assert saved["last_signal"]["metadata"]["risk_multiplier"] == 0.5
+    assert saved["last_signal"]["metadata"]["sizing_source"] == "balance_allocation"
+    assert saved["last_signal"]["balance_allocation_amount"] == 10000.0
+    assert saved["last_signal"]["size"] == 2.0
+    assert round(saved["last_signal"]["risk_amount"], 2) == 10.2
 
 
 def test_run_forever_publishes_error_status_on_cycle_failure(monkeypatch) -> None:
@@ -491,6 +502,7 @@ def test_service_telegram_uses_embedded_client_heartbeat_minutes(monkeypatch) ->
 def test_run_cycle_publishes_account_snapshot_fields(tmp_path, monkeypatch) -> None:
     _disable_redis(monkeypatch)
     runtime = GoldBotRuntime()
+    _isolate_runtime_files(runtime, tmp_path)
     runtime.state_path = tmp_path / "state.json"
     runtime._save_state({"signals": [], "open_trades": [], "events": []})
 

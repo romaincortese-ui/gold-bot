@@ -75,5 +75,51 @@ def test_live_xau_size_does_not_round_up_past_risk_budget(monkeypatch) -> None:
     monkeypatch.setattr(client, "_estimate_conversion_rate", lambda base, quote: 0.75)
 
     assert client.calculate_xau_size(0.72, 59.111, "GBP") == 0.0
-    assert client.calculate_xau_size(100.0, 50.0, "GBP") == 2.0
-    assert client.estimate_xau_risk_amount(2.0, 50.0, "GBP") == 75.0
+    assert client.calculate_xau_size(100.0, 50.0, "GBP") == 2.6
+    assert client.estimate_xau_risk_amount(2.6, 50.0, "GBP") == 97.5
+
+
+def test_live_xau_balance_size_uses_full_margin_balance(monkeypatch) -> None:
+    settings = build_settings()
+    settings = type(settings)(
+        **{
+            **settings.__dict__,
+            "execution_mode": "live",
+            "oanda_api_key": "key",
+            "oanda_account_id": "account",
+            "leverage": 20.0,
+        }
+    )
+    client = OandaClient(settings)
+    monkeypatch.setattr(client, "_estimate_conversion_rate", lambda base, quote: 0.75)
+
+    assert client.calculate_xau_balance_size(50.0, 4696.0, "GBP") == 0.2
+    assert round(client.estimate_xau_margin_amount(0.2, 4696.0, "GBP"), 2) == 35.22
+
+
+def test_place_market_order_requires_fill_transaction(monkeypatch) -> None:
+    settings = build_settings()
+    settings = type(settings)(
+        **{
+            **settings.__dict__,
+            "execution_mode": "live",
+            "oanda_api_key": "key",
+            "oanda_account_id": "account",
+        }
+    )
+    client = OandaClient(settings)
+    monkeypatch.setattr(client, "_post", lambda path, payload: {"orderCancelTransaction": {"reason": "INSUFFICIENT_MARGIN"}})
+
+    opportunity = Opportunity(
+        strategy="MACRO_BREAKOUT",
+        direction="LONG",
+        score=80.0,
+        entry_price=3000.6,
+        stop_price=2995.0,
+        take_profit_price=None,
+        risk_per_unit=5.6,
+        rationale="test",
+    )
+
+    with pytest.raises(RuntimeError, match="INSUFFICIENT_MARGIN"):
+        client.place_market_order(opportunity, 0.2, quote={"bid": 3000.0, "ask": 3000.2, "mid": 3000.1, "spread": 0.2})

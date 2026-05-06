@@ -44,7 +44,6 @@ from goldbot.central_bank_flow import (
     load_central_bank_flow_from_macro_state,
 )
 from goldbot.shared_backend import load_json_payload, publish_runtime_status, save_json_payload
-from goldbot.sizing import compute_risk_amount
 from goldbot.spread_tracker import SpreadTracker
 from goldbot.weekend_guard import (
     WeekendDecision,
@@ -537,110 +536,8 @@ class GoldBotRuntime:
             self._publish_runtime_status("scanning", state, balance=balance)
             return None
 
-        calibration_risk_mult = float(best.metadata.get("calibration_risk_mult", 1.0) or 1.0)
-        calibration_risk_mult = max(0.5, min(1.5, calibration_risk_mult))  # clamp to safe range
-        risk_multiplier = float(best.metadata.get("risk_multiplier", 1.0) or 1.0) * calibration_risk_mult
-
-        # Sprint 1 (2.4): volatility-target sizing. Compute a vol-adjusted
-        # risk budget so that 1 ATR of adverse move consumes `vol_target_nav_bps`
-        # of NAV. Always clamped by the legacy %-of-sleeve cap and the
-        # portfolio-wide available budget — this only ever reduces size on
-        # high-vol days vs. fixed 0.75%-of-sleeve sizing.
-        # Sprint 1 (2.8): if the drawdown kill-switch soft-cut fired this
-        # cycle, override max_trade_risk_amount to the soft-cut fraction of
-        # the gold sleeve balance. Hard halt is already handled earlier.
-        legacy_cap = snapshot.max_trade_risk_amount
-        if kill_decision is not None and kill_decision.soft_cut and kill_decision.risk_per_trade_override is not None:
-            legacy_cap = snapshot.gold_sleeve_balance * float(kill_decision.risk_per_trade_override)
-            log.info(
-                "Drawdown soft-cut active: reducing per-trade risk to %.2f%% of sleeve (%.2f)",
-                kill_decision.risk_per_trade_override * 100,
-                legacy_cap,
-            )
-
-        nav = float(state.get("account_nav", balance) or balance)
-        atr_for_sizing = float(best.metadata.get("atr") or 0.0)
-        sizing_decision = compute_risk_amount(
-            nav=nav,
-            atr=atr_for_sizing,
-            stop_distance=best.risk_per_unit,
-            target_nav_bps=self.settings.vol_target_nav_bps,
-            legacy_max_trade_risk=legacy_cap,
-            available_gold_risk=snapshot.available_gold_risk,
-            enabled=self.settings.vol_target_sizing_enabled,
-            risk_multiplier=risk_multiplier,
-        )
-        risk_amount = sizing_decision.risk_amount
-        best.metadata["sizing_source"] = sizing_decision.source
-        best.metadata["sizing_nav"] = round(sizing_decision.nav, 2)
-        best.metadata["sizing_atr"] = round(sizing_decision.atr, 4)
-        best.metadata["sizing_target_nav_bps"] = sizing_decision.target_nav_bps
-        if risk_amount <= 0:
-            log.info("No gold risk budget available (source=%s)", sizing_decision.source)
-            state.update({"last_run_at": now.isoformat(), "last_session": session_name, "skip_reason": "risk_budget_exhausted"})
-            self._save_state(state)
-            self._publish_runtime_status("risk_budget_exhausted", state, balance=balance)
-            return None
-
-        target_risk_amount = risk_amount
-        size = self.client.calculate_xau_size(target_risk_amount, best.risk_per_unit, account_currency)
-        if size <= 0:
-            log.info("Unable to size XAU/USD trade")
-            state.update({
-                "last_run_at": now.isoformat(),
-                "last_session": session_name,
-                "skip_reason": "size_zero",
-                "last_signal": {
-                    **asdict(best),
-                    "risk_amount": target_risk_amount,
-                    "size": size,
-                    "budget_snapshot": asdict(snapshot),
-                    "sizing_reject_reason": "minimum_xau_unit_exceeds_risk_budget",
-                },
-            })
-            self._save_state(state)
-            self._publish_runtime_status("size_zero", state, balance=balance)
-            return None
-
-        risk_amount = self.client.estimate_xau_risk_amount(size, best.risk_per_unit, account_currency)
-        if risk_amount <= 0 or risk_amount > target_risk_amount + max(0.01, target_risk_amount * 0.01):
-            log.warning(
-                "Sized XAU/USD risk %.2f exceeds target budget %.2f; skipping entry",
-                risk_amount,
-                target_risk_amount,
-            )
-            state.update({
-                "last_run_at": now.isoformat(),
-                "last_session": session_name,
-                "skip_reason": "size_exceeds_risk_budget",
-                "last_signal": {
-                    **asdict(best),
-                    "risk_amount": target_risk_amount,
-                    "sized_risk_amount": risk_amount,
-                    "size": size,
-                    "budget_snapshot": asdict(snapshot),
-                },
-            })
-            self._save_state(state)
-            self._publish_runtime_status("size_zero", state, balance=balance)
-            return None
-
         try:
             entry_quote = self._await_entry_quote(best)
-            # Gate A G5 (memo 1 §7): audit line immediately before the OANDA
-            # call — exposes spread the bot actually saw vs. the configured
-            # cap at entry time, matching the FX-bot [ENTRY_SPREAD] pattern.
-            entry_spread = float(entry_quote.get("spread", 0.0) or 0.0) if entry_quote else 0.0
-            log.info(
-                "[ENTRY_SPREAD] strategy=%s instrument=%s direction=%s spread=%.4f cap=%.2f mode=%s",
-                best.strategy,
-                self.settings.instrument,
-                best.direction,
-                entry_spread,
-                self.settings.max_entry_spread,
-                self.settings.execution_mode,
-            )
-            result = self.client.place_market_order(best, size, quote=entry_quote)
         except SpreadTooWideError as exc:
             log.info("Skipping execution because spread is too wide: %s", exc)
             self._record_event(state, "spread_too_wide", str(exc), now=now)
@@ -651,13 +548,81 @@ class GoldBotRuntime:
                     "skip_reason": "spread_too_wide",
                     "last_signal": {
                         **asdict(best),
-                        "risk_amount": risk_amount,
-                        "size": size,
                         "budget_snapshot": asdict(snapshot),
                     },
                 }
             )
             self._publish_runtime_status("spread_too_wide", self._load_state(), balance=balance)
+            return None
+
+        entry_price_for_sizing = float(entry_quote["ask"] if best.direction == "LONG" else entry_quote["bid"])
+        balance_for_entry = float(account.get("margin_available", balance) or balance)
+        size = self.client.calculate_xau_balance_size(balance_for_entry, entry_price_for_sizing, account_currency)
+        if size <= 0:
+            log.info("Unable to size XAU/USD trade from balance allocation")
+            state.update({
+                "last_run_at": now.isoformat(),
+                "last_session": session_name,
+                "skip_reason": "size_zero",
+                "last_signal": {
+                    **asdict(best),
+                    "balance_allocation_amount": balance_for_entry,
+                    "size": size,
+                    "budget_snapshot": asdict(snapshot),
+                    "sizing_reject_reason": "minimum_xau_unit_exceeds_balance_allocation",
+                },
+            })
+            self._save_state(state)
+            self._publish_runtime_status("size_zero", state, balance=balance)
+            return None
+
+        best.entry_price = entry_price_for_sizing
+        best.risk_per_unit = abs(entry_price_for_sizing - float(best.stop_price))
+        risk_amount = self.client.estimate_xau_risk_amount(size, best.risk_per_unit, account_currency)
+        margin_amount = self.client.estimate_xau_margin_amount(size, entry_price_for_sizing, account_currency)
+        best.metadata["sizing_source"] = "balance_allocation"
+        best.metadata["sizing_balance_allocation_pct"] = 1.0
+        best.metadata["sizing_balance_amount"] = round(balance_for_entry, 2)
+        best.metadata["sizing_margin_amount"] = round(margin_amount, 2)
+        best.metadata["sizing_stop_risk_amount"] = round(risk_amount, 2)
+
+        try:
+            # Gate A G5 (memo 1 §7): audit line immediately before the OANDA
+            # call — exposes spread the bot actually saw vs. the configured
+            # cap at entry time, matching the FX-bot [ENTRY_SPREAD] pattern.
+            entry_spread = float(entry_quote.get("spread", 0.0) or 0.0) if entry_quote else 0.0
+            log.info(
+                "[ENTRY_SPREAD] strategy=%s instrument=%s direction=%s spread=%.4f cap=%.2f mode=%s size=%.1f balance_alloc=%.2f margin=%.2f stop_risk=%.2f",
+                best.strategy,
+                self.settings.instrument,
+                best.direction,
+                entry_spread,
+                self.settings.max_entry_spread,
+                self.settings.execution_mode,
+                size,
+                balance_for_entry,
+                margin_amount,
+                risk_amount,
+            )
+            result = self.client.place_market_order(best, size, quote=entry_quote)
+        except RuntimeError as exc:
+            log.warning("Skipping execution because OANDA did not fill the order: %s", exc)
+            self._record_event(state, "order_not_filled", str(exc), now=now)
+            state.update({
+                "last_run_at": now.isoformat(),
+                "last_session": session_name,
+                "skip_reason": "order_not_filled",
+                "last_signal": {
+                    **asdict(best),
+                    "risk_amount": risk_amount,
+                    "balance_allocation_amount": balance_for_entry,
+                    "margin_amount": margin_amount,
+                    "size": size,
+                    "budget_snapshot": asdict(snapshot),
+                },
+            })
+            self._save_state(state)
+            self._publish_runtime_status("order_not_filled", state, balance=balance)
             return None
         self.budget.reserve_gold_risk(str(result["id"]), risk_amount, best.strategy)
         log.info(
@@ -681,7 +646,8 @@ class GoldBotRuntime:
                 "mode": result.get("mode", self.settings.execution_mode),
                 "score": float(best.score),
                 "account_currency": account_currency,
-                "target_risk_amount": float(target_risk_amount),
+                "balance_allocation_amount": float(balance_for_entry),
+                "margin_amount": float(margin_amount),
                 "gold_sleeve_balance": float(snapshot.gold_sleeve_balance),
                 "max_trade_risk_amount": float(snapshot.max_trade_risk_amount),
                 "max_total_risk_amount": float(snapshot.max_total_risk_amount),
@@ -706,6 +672,8 @@ class GoldBotRuntime:
                     **asdict(best),
                     "result": result,
                     "risk_amount": risk_amount,
+                    "balance_allocation_amount": balance_for_entry,
+                    "margin_amount": margin_amount,
                     "size": size,
                     "budget_snapshot": asdict(snapshot),
                 },
@@ -1138,15 +1106,8 @@ class GoldBotRuntime:
         if (not trade.get("partial_taken")) and self._reached_level(trade["direction"], current_price, float(exit_plan["partial_take_profit_price"])):
             remaining = float(trade.get("remaining_size", trade["size"]))
             fraction = float(exit_plan.get("partial_take_profit_fraction", 0.5))
-            # OANDA XAU_USD trades are denominated in integer units. Snap the
-            # partial-close size to a positive integer that does not exceed the
-            # remaining position; otherwise OANDA rejects the close with
-            # 400 Bad Request (e.g. units=0 on a 1-unit trade where 50% rounds
-            # down to 0). Without this guard the failed close keeps retrying
-            # every cycle because partial_taken is never set.
-            remaining_units = int(round(remaining))
-            partial_units = int(round(remaining * fraction))
-            if remaining_units <= 1 or partial_units < 1:
+            partial_units = self.client._round_xau_units_down(remaining * fraction)
+            if remaining <= 0.1 or partial_units <= 0:
                 # Position too small to scale out. Mark partial_taken so the
                 # break-even / trailing-stop logic below can take over and we
                 # do not retry the broken partial-close every cycle.
@@ -1154,10 +1115,10 @@ class GoldBotRuntime:
                 self._record_event(
                     state,
                     "partial_skipped",
-                    f"Trade {trade['id']} partial profit skipped (remaining size {remaining_units} too small to scale out)",
+                    f"Trade {trade['id']} partial profit skipped (remaining size {remaining:.1f} too small to scale out)",
                     now=datetime.now(timezone.utc),
                 )
-            elif partial_units >= remaining_units:
+            elif partial_units >= remaining:
                 # Snap to a full close instead of asking OANDA to close more
                 # than the trade currently holds.
                 if self.client.close_trade(str(trade["id"])):
@@ -1166,7 +1127,7 @@ class GoldBotRuntime:
                     self._record_event(
                         state,
                         "partial_profit",
-                        f"Trade {trade['id']} closed in full at partial-profit target (size {remaining_units} too small to scale out)",
+                        f"Trade {trade['id']} closed in full at partial-profit target (remaining size {remaining:.1f} too small to scale out)",
                         now=datetime.now(timezone.utc),
                     )
             else:

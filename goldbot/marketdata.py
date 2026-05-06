@@ -16,6 +16,8 @@ log = logging.getLogger(__name__)
 _TRANSIENT_STATUS_CODES = {502, 503, 504, 429}
 _MAX_RETRIES = 3
 _RETRY_BACKOFF = 2  # seconds, doubles each attempt
+_XAU_TRADE_UNITS_PRECISION = 1
+_XAU_MIN_TRADE_SIZE = 0.1
 
 _URL_PATTERN = __import__("re").compile(r'for url: https?://\S+|https?://\S+')
 
@@ -201,8 +203,24 @@ class OandaClient:
         per_unit_risk = stop_distance * conversion
         if per_unit_risk <= 0:
             return 0.0
-        units = math.floor(risk_amount / per_unit_risk)
-        return float(units) if units >= 1 else 0.0
+        return self._round_xau_units_down(risk_amount / per_unit_risk)
+
+    def calculate_xau_balance_size(self, balance_amount: float, entry_price: float, account_currency: str) -> float:
+        if balance_amount <= 0 or entry_price <= 0:
+            return 0.0
+        conversion = self._estimate_conversion_rate("USD", account_currency) if self.uses_native_units() else 1.0
+        margin_rate = 1.0 / max(float(self.settings.leverage), 1.0)
+        margin_per_unit = float(entry_price) * conversion * margin_rate
+        if margin_per_unit <= 0:
+            return 0.0
+        return self._round_xau_units_down(float(balance_amount) / margin_per_unit)
+
+    def estimate_xau_margin_amount(self, size: float, entry_price: float, account_currency: str) -> float:
+        if size <= 0 or entry_price <= 0:
+            return 0.0
+        conversion = self._estimate_conversion_rate("USD", account_currency) if self.uses_native_units() else 1.0
+        margin_rate = 1.0 / max(float(self.settings.leverage), 1.0)
+        return abs(float(size)) * float(entry_price) * conversion * margin_rate
 
     def estimate_xau_risk_amount(self, size: float, stop_distance: float, account_currency: str) -> float:
         if size <= 0 or stop_distance <= 0:
@@ -226,19 +244,25 @@ class OandaClient:
                 "strategy": opportunity.strategy,
             }
 
-        signed_units = int(abs(size)) if opportunity.direction == "LONG" else -int(abs(size))
+        unsigned_units = self._round_xau_units_down(abs(float(size)))
+        if unsigned_units <= 0:
+            raise RuntimeError(f"XAU/USD order size {size!r} is below minimum trade size")
+        signed_units = unsigned_units if opportunity.direction == "LONG" else -unsigned_units
         order = {
             "order": {
                 "type": "MARKET",
                 "instrument": self.settings.instrument,
-                "units": str(signed_units),
+                "units": self._format_units(signed_units),
                 "timeInForce": "FOK",
                 "positionFill": "DEFAULT",
                 "stopLossOnFill": {"price": self._format_price(opportunity.stop_price)},
             }
         }
         payload = self._post(f"/v3/accounts/{self.settings.oanda_account_id}/orders", order)
-        fill = payload.get("orderFillTransaction", {})
+        fill = payload.get("orderFillTransaction")
+        if not fill:
+            reason = payload.get("orderCancelTransaction", {}).get("reason") or payload.get("orderRejectTransaction", {}).get("reason") or "missing_fill"
+            raise RuntimeError(f"OANDA market order was not filled: {reason}")
         return {
             "id": str(fill.get("id") or fill.get("orderID") or ""),
             "instrument": self.settings.instrument,
@@ -267,18 +291,15 @@ class OandaClient:
             return True
         payload: dict[str, str] = {}
         if size is not None:
-            units = int(round(abs(float(size))))
+            units = self._round_xau_units_down(abs(float(size)))
             if units <= 0:
-                # Defensive guard: OANDA rejects units=0 with 400 Bad Request,
-                # which would otherwise loop forever once a partial-close is
-                # triggered on a sub-rounding-threshold size.
                 log.warning(
                     "close_trade(%s) ignored: requested size %r rounds to 0 units",
                     trade_id,
                     size,
                 )
                 return False
-            payload["units"] = str(units)
+            payload["units"] = self._format_units(units)
         response = self._put(
             f"/v3/accounts/{self.settings.oanda_account_id}/trades/{trade_id}/close",
             payload,
@@ -368,6 +389,19 @@ class OandaClient:
     @staticmethod
     def _format_price(price: float) -> str:
         return f"{price:.3f}"
+
+    @staticmethod
+    def _round_xau_units_down(units: float) -> float:
+        if units <= 0:
+            return 0.0
+        factor = 10 ** _XAU_TRADE_UNITS_PRECISION
+        rounded = math.floor(float(units) * factor) / factor
+        return rounded if rounded >= _XAU_MIN_TRADE_SIZE else 0.0
+
+    @staticmethod
+    def _format_units(units: float) -> str:
+        text = f"{float(units):.{_XAU_TRADE_UNITS_PRECISION}f}"
+        return text.rstrip("0").rstrip(".") if "." in text else text
 
     @staticmethod
     def _granularity_to_timedelta(granularity: str) -> timedelta:

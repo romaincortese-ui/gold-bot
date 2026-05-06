@@ -118,13 +118,15 @@ class GoldBacktestEngine:
             if self._is_cooldown_active(cooldowns, opportunity, timestamp):
                 continue
 
-            risk_multiplier = float(opportunity.metadata.get("risk_multiplier", 1.0) or 1.0)
-            risk_amount = balance * self.settings.gold_budget_allocation * self.settings.max_risk_per_trade * risk_multiplier
-            size = self.client.calculate_xau_size(risk_amount, opportunity.risk_per_unit, account_currency="USD")
+            entry_price = self._entry_price(opportunity, now=timestamp, events=events)
+            size = self.client.calculate_xau_balance_size(balance, entry_price, account_currency="USD")
             if size <= 0:
                 continue
-
-            entry_price = self._entry_price(opportunity, now=timestamp, events=events)
+            risk_amount = self.client.estimate_xau_risk_amount(
+                size,
+                abs(entry_price - float(opportunity.stop_price)),
+                account_currency="USD",
+            )
             open_trade = {
                 "instrument": self.settings.instrument,
                 "strategy": opportunity.strategy,
@@ -288,10 +290,16 @@ class GoldBacktestEngine:
         exit_plan = dict(trade.get("exit_plan", {}))
         if exit_plan:
             if (not trade.get("partial_taken")) and self._level_hit(trade["direction"], bar, float(exit_plan["partial_take_profit_price"])):
-                partial_size = max(0.1, float(trade["remaining_size"]) * float(exit_plan.get("partial_take_profit_fraction", 0.5)))
-                trade["realized_partial_pnl"] = float(trade.get("realized_partial_pnl", 0.0)) + self._price_pnl(trade["direction"], trade["entry_price"], float(exit_plan["partial_take_profit_price"]), partial_size)
-                trade["remaining_size"] = max(0.0, float(trade["remaining_size"]) - partial_size)
-                trade["partial_taken"] = True
+                remaining_size = float(trade["remaining_size"])
+                partial_size = self.client._round_xau_units_down(remaining_size * float(exit_plan.get("partial_take_profit_fraction", 0.5)))
+                if remaining_size <= 0.1 or partial_size <= 0:
+                    trade["partial_taken"] = True
+                else:
+                    if partial_size >= remaining_size:
+                        partial_size = remaining_size
+                    trade["realized_partial_pnl"] = float(trade.get("realized_partial_pnl", 0.0)) + self._price_pnl(trade["direction"], trade["entry_price"], float(exit_plan["partial_take_profit_price"]), partial_size)
+                    trade["remaining_size"] = max(0.0, remaining_size - partial_size)
+                    trade["partial_taken"] = True
 
             if (not trade.get("break_even_moved")) and self._level_hit(trade["direction"], bar, float(exit_plan["break_even_trigger_price"])):
                 trade["stop_price"] = float(trade["entry_price"])
