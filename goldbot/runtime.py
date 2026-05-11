@@ -85,9 +85,9 @@ class GoldBotRuntime:
         self.telegram_token = os.getenv("GOLD_TELEGRAM_TOKEN", "").strip()
         self.telegram_chat_id = os.getenv("GOLD_TELEGRAM_CHAT_ID", "").strip()
         self.telegram_poll_seconds = max(1, int(os.getenv("GOLD_TELEGRAM_POLL_SECONDS", "5")))
-        self.telegram_status_heartbeat_minutes = max(0, int(os.getenv("GOLD_TELEGRAM_HEARTBEAT_MINUTES", "60")))
+        self.telegram_status_heartbeat_minutes = max(0, int(os.getenv("GOLD_TELEGRAM_HEARTBEAT_MINUTES", "360")))
         self.telegram_offset_path = Path(os.getenv("GOLD_TELEGRAM_OFFSET_FILE", "telegram_state.json"))
-        self.heartbeat_interval = int(os.getenv("GOLD_HEARTBEAT_INTERVAL", "3600"))
+        self.heartbeat_interval = int(os.getenv("GOLD_HEARTBEAT_INTERVAL", "21600"))
         self.last_heartbeat_at = 0.0
         self.calibration_file = os.getenv("GOLD_CALIBRATION_FILE", CALIBRATION_FILE).strip()
         self.calibration_redis_key = os.getenv("GOLD_CALIBRATION_REDIS_KEY", CALIBRATION_REDIS_KEY).strip()
