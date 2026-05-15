@@ -84,11 +84,10 @@ def score_macro_breakout(
             getattr(settings, "breakout_session_open_box_hours", settings.breakout_box_hours)
         )
         box_hours_used = box_hours_sess
-        # Anchor the box to the MOST RECENT session-open hour that has already
-        # occurred (the London or NY open preceding `now`), not to `now`
-        # itself. This way, as the session progresses we keep testing whether
-        # current price has broken out of the pre-session consolidation.
-        session_open_anchor_hours = sorted({int(x) for x in (7, 12)})
+        # Anchor the box to the MOST RECENT configured session-open hour that
+        # has already occurred, not to `now` itself. This keeps the pre-session
+        # consolidation stable while still honoring extended operator hours.
+        session_open_anchor_hours = sorted(allowed_hours or {7, 12})
         anchor_hour = max(
             (h for h in session_open_anchor_hours if h <= now.hour),
             default=session_open_anchor_hours[0],
@@ -148,7 +147,9 @@ def score_macro_breakout(
     last_close = float(df_m15["close"].iloc[-1])
     # Session-open breakouts often only print 1-2 M15 closes outside the box
     # before the initial thrust — demanding 3 consecutive closes rejected 61
-    # otherwise-valid setups in the validation window.
+    # otherwise-valid setups in the validation window. For the stronger
+    # range-expansion variant, the oversized impulse candle is the confirmation,
+    # so one outside close is enough.
     closes_window = 2 if session_open_mode else 3
     recent_closes = df_m15["close"].tail(closes_window)
     breakout_volume = float(df_m15["volume"].iloc[-1])
@@ -215,6 +216,7 @@ def score_macro_breakout(
                 f"body_atr={impulse_signal.body_atr_ratio:.2f}<{expansion_body_min:.2f}",
             )
             return None
+        recent_closes = df_m15["close"].tail(1)
         volume_confirmation["strategy_variant"] = "RANGE_EXPANSION_CONTINUATION"
         volume_confirmation["wide_box_atr_ratio"] = round(box_width_ratio, 2)
 

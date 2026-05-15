@@ -162,6 +162,117 @@ def test_score_macro_breakout_range_expansion_is_separate_session_open_path() ->
     assert opportunity.metadata["strategy_variant"] == "RANGE_EXPANSION_CONTINUATION"
 
 
+def test_score_macro_breakout_range_expansion_accepts_one_impulse_close_short() -> None:
+    settings = build_settings()
+    settings = Settings(
+        **{
+            **settings.__dict__,
+            "breakout_overlap_only": False,
+            "breakout_session_open_hours_utc": "7,12,13,14,15",
+            "breakout_session_open_min_box_atr_ratio": 2.75,
+            "breakout_range_expansion_max_box_atr_ratio": 5.0,
+            "breakout_range_expansion_body_atr_min": 0.8,
+        }
+    )
+    now = datetime(2026, 4, 6, 13, 30, tzinfo=timezone.utc)
+
+    h1_times = pd.date_range(end=now.replace(minute=0), periods=40, freq="h", tz="UTC")
+    h1_rows = []
+    for timestamp in h1_times:
+        in_box = 5 <= timestamp.hour < 13 and timestamp.date() == now.date()
+        if in_box:
+            close = 3000.0 + (timestamp.hour - 5) * 2.0
+            high = close + 2.0
+            low = close - 2.0
+        else:
+            close = 3010.0
+            high = 3012.0
+            low = 3008.0
+        h1_rows.append({"time": timestamp, "open": close - 0.5, "high": high, "low": low, "close": close, "volume": 100})
+    df_h1 = pd.DataFrame(h1_rows)
+
+    m15_times = pd.date_range(end=now, periods=60, freq="15min", tz="UTC")
+    m15_rows = []
+    for index, timestamp in enumerate(m15_times):
+        close = 3010.0
+        open_price = close + 0.3
+        high = close + 4.0
+        low = close - 4.0
+        if index == len(m15_times) - 2:
+            close = 3001.0
+            open_price = 3002.0
+            high = 3002.5
+            low = 3000.5
+        if index == len(m15_times) - 1:
+            close = 2988.0
+            open_price = 3004.0
+            high = 3004.4
+            low = 2987.5
+        m15_rows.append({"time": timestamp, "open": open_price, "high": high, "low": low, "close": close, "volume": 180})
+    df_m15 = pd.DataFrame(m15_rows)
+
+    reasons: list[str] = []
+    opportunity = score_macro_breakout(settings, now, "OVERLAP", df_m15, df_h1, [], reasons=reasons)
+
+    assert opportunity is not None, reasons
+    assert opportunity.strategy == "RANGE_EXPANSION_CONTINUATION"
+    assert opportunity.direction == "SHORT"
+    assert opportunity.metadata["strategy_variant"] == "RANGE_EXPANSION_CONTINUATION"
+
+
+def test_score_macro_breakout_session_open_uses_configured_anchor_hours() -> None:
+    settings = build_settings()
+    settings = Settings(
+        **{
+            **settings.__dict__,
+            "breakout_overlap_only": False,
+            "breakout_session_open_hours_utc": "14",
+            "breakout_session_open_min_box_atr_ratio": 10.0,
+        }
+    )
+    now = datetime(2026, 4, 6, 14, 0, tzinfo=timezone.utc)
+
+    h1_times = pd.date_range(end=now, periods=40, freq="h", tz="UTC")
+    h1_rows = []
+    for timestamp in h1_times:
+        if timestamp.date() == now.date() and timestamp.hour in {4, 5}:
+            low = 2950.0
+            high = 3050.0
+            close = 3000.0
+        elif timestamp.date() == now.date() and 6 <= timestamp.hour < 14:
+            low = 3000.0
+            high = 3020.0
+            close = 3010.0
+        else:
+            low = 3008.0
+            high = 3012.0
+            close = 3010.0
+        h1_rows.append({"time": timestamp, "open": close - 0.5, "high": high, "low": low, "close": close, "volume": 100})
+    df_h1 = pd.DataFrame(h1_rows)
+
+    m15_times = pd.date_range(end=now, periods=60, freq="15min", tz="UTC")
+    m15_rows = []
+    for index, timestamp in enumerate(m15_times):
+        close = 3010.0
+        open_price = close + 0.3
+        high = close + 4.0
+        low = close - 4.0
+        if index >= len(m15_times) - 2:
+            close = 2994.0 - (len(m15_times) - 1 - index) * 0.5
+            open_price = 3001.5
+            high = 3002.0
+            low = 2993.5
+        m15_rows.append({"time": timestamp, "open": open_price, "high": high, "low": low, "close": close, "volume": 180})
+    df_m15 = pd.DataFrame(m15_rows)
+
+    reasons: list[str] = []
+    opportunity = score_macro_breakout(settings, now, "OVERLAP", df_m15, df_h1, [], reasons=reasons)
+
+    assert opportunity is not None, reasons
+    assert opportunity.direction == "SHORT"
+    assert opportunity.metadata["box_low"] == 3000.0
+
+
 def test_score_event_catalyst_breakout_requires_aligned_price_break() -> None:
     settings = build_settings()
     now = datetime(2026, 4, 6, 13, 0, tzinfo=timezone.utc)
